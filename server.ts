@@ -136,8 +136,11 @@ app.post('/render', async (req: Request, res: Response) => {
         '-t', duration.toString(),
         '-vf', videoFilter,
         '-c:v', 'libx264',
+        '-preset', 'ultrafast', // Faster encoding, less memory
+        '-crf', '23', // Quality (18-28, lower = better)
         '-pix_fmt', 'yuv420p',
         '-r', fps.toString(),
+        '-threads', '2', // Limit threads to reduce memory
         clipPath,
       ]
       
@@ -150,7 +153,10 @@ app.post('/render', async (req: Request, res: Response) => {
       }).join(' ')
 
       try {
-        await execAsync(ffmpegCmd)
+        await execAsync(ffmpegCmd, { 
+          shell: '/bin/bash',
+          maxBuffer: 10 * 1024 * 1024, // 10MB buffer
+        })
         clipPaths.push(clipPath)
       } catch (error) {
         console.error(`[${jobId}] Error creating clip ${i}:`, error)
