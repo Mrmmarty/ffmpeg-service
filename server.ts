@@ -102,34 +102,52 @@ app.post('/render', async (req: Request, res: Response) => {
       const duration = segment.duration || 3
       
       // Build FFmpeg filter for text overlay
-      let textFilter = ''
+      let videoFilter = `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}`
+      
       if (segment.textOverlay) {
-        // Escape text for FFmpeg
+        // Escape text for FFmpeg drawtext filter
+        // Replace special characters that break shell/FFmpeg parsing
         const escapedText = segment.textOverlay
           .replace(/\\/g, '\\\\')
           .replace(/:/g, '\\:')
           .replace(/'/g, "\\'")
           .replace(/"/g, '\\"')
+          .replace(/\(/g, '\\(')
+          .replace(/\)/g, '\\)')
+          .replace(/\[/g, '\\[')
+          .replace(/\]/g, '\\]')
+          .replace(/\{/g, '\\{')
+          .replace(/\}/g, '\\}')
         
         const fontSize = segment.type === 'cta' ? 72 : segment.type === 'opener' ? 56 : 48
         const yPosition = segment.type === 'cta' ? 'h-th-150' : segment.type === 'opener' ? '100' : '80'
         
-        textFilter = `drawtext=text='${escapedText}':fontsize=${fontSize}:fontcolor=white:x=(w-text_w)/2:y=${yPosition}:box=1:boxcolor=black@0.5:boxborderw=5`
+        // Use escaped text in drawtext filter
+        const textFilter = `drawtext=text='${escapedText}':fontsize=${fontSize}:fontcolor=white:x=(w-text_w)/2:y=${yPosition}:box=1:boxcolor=black@0.5:boxborderw=5`
+        videoFilter += `,${textFilter}`
       }
 
       // Create video clip from image
-      const ffmpegCmd = [
-        'ffmpeg',
-        '-y', // Overwrite output
+      // Use array format to avoid shell escaping issues
+      const ffmpegArgs = [
+        '-y',
         '-loop', '1',
         '-i', imagePaths[i],
         '-t', duration.toString(),
-        '-vf', `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}${textFilter ? ',' + textFilter : ''}`,
+        '-vf', videoFilter,
         '-c:v', 'libx264',
         '-pix_fmt', 'yuv420p',
         '-r', fps.toString(),
         clipPath,
-      ].filter(Boolean).join(' ')
+      ]
+      
+      const ffmpegCmd = ['ffmpeg', ...ffmpegArgs].map(arg => {
+        // Properly escape arguments with spaces or special chars
+        if (arg.includes(' ') || arg.includes('(') || arg.includes(')')) {
+          return `"${arg.replace(/"/g, '\\"')}"`
+        }
+        return arg
+      }).join(' ')
 
       try {
         await execAsync(ffmpegCmd)
