@@ -176,19 +176,34 @@ app.post('/render', async (req: Request, res: Response) => {
       const segmentDurations = segments.map(s => s.duration || 3)
       const filterComplex = buildTransitionFilter(clipPaths, transitionType, transitionDuration, fps, segmentDurations)
       
-      const concatCmd = [
-        'ffmpeg',
+      // Build concatenation command with proper quoting
+      const concatArgs = [
         '-y',
         ...clipPaths.flatMap((clip, i) => ['-i', clip]),
-        '-filter_complex', filterComplex,
+        '-filter_complex', filterComplex, // filterComplex contains brackets, needs quoting
         '-c:v', 'libx264',
+        '-preset', 'ultrafast', // Faster encoding
         '-pix_fmt', 'yuv420p',
         '-r', fps.toString(),
+        '-threads', '2', // Limit threads
         finalVideoPath,
-      ].join(' ')
+      ]
+      
+      // Properly escape arguments
+      const escapedConcatArgs = concatArgs.map(arg => {
+        if (/[\s()\[\]{}:;'"`$&|<>]/.test(arg)) {
+          return `'${arg.replace(/'/g, "'\\''")}'`
+        }
+        return arg
+      })
+      
+      const concatCmd = `ffmpeg ${escapedConcatArgs.join(' ')}`
 
       try {
-        await execAsync(concatCmd)
+        await execAsync(concatCmd, { 
+          shell: '/bin/bash',
+          maxBuffer: 10 * 1024 * 1024, // 10MB buffer
+        })
       } catch (error) {
         console.error(`[${jobId}] Error concatenating clips:`, error)
         throw new Error(`Failed to concatenate clips: ${error instanceof Error ? error.message : 'Unknown error'}`)
