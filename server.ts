@@ -181,6 +181,7 @@ app.post('/render', async (req: Request, res: Response) => {
         '-y',
         ...clipPaths.flatMap((clip, i) => ['-i', clip]),
         '-filter_complex', filterComplex, // filterComplex contains brackets, needs quoting
+        '-map', '[v]', // Map the output from filter_complex
         '-c:v', 'libx264',
         '-preset', 'ultrafast', // Faster encoding
         '-pix_fmt', 'yuv420p',
