@@ -98,15 +98,40 @@ app.post('/render', async (req: Request, res: Response) => {
     
     for (let i = 0; i < segments.length; i++) {
       const segment = segments[i]
+      
+      // Process image to fit vertical format (1080x1920) - show whole car
+      // Use scale and crop to maintain aspect ratio while fitting vertical format
       const clipPath = path.join(workDir, `clip-${i}.mp4`)
       const duration = segment.duration || 3
       
-      // Build FFmpeg filter for text overlay
-      let videoFilter = `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}`
+      // Build FFmpeg filter - scale to fit vertical format while showing whole car
+      // Use scale with fit to maintain aspect ratio and show entire image
+      // This ensures we see the whole car, not cropped
+      // Add Ken Burns effect (slow zoom/pan) for dynamic movement
+      
+      // Ken Burns parameters:
+      // - Start zoom: 1.0 (no zoom)
+      // - End zoom: 1.1 (10% zoom in)
+      // - Pan: slight movement (optional)
+      const startZoom = 1.0
+      const endZoom = 1.1
+      const zoomSpeed = (endZoom - startZoom) / (duration * fps) // Increment per frame
+      
+      // Scale image larger first to allow zoom room (scale to 120% to allow zoom to 110%)
+      const scaleFactor = 1.2
+      const scaledWidth = Math.round(width * scaleFactor)
+      const scaledHeight = Math.round(height * scaleFactor)
+      
+      // Step 1: Scale image larger with padding (to allow zoom room)
+      // Step 2: Apply Ken Burns zoom effect
+      // zoompan syntax: z='zoom+increment':d=duration_in_frames:s=output_size
+      // z='zoom+0.0005' means zoom increases by 0.0005 per frame
+      const kenBurnsFilter = `scale=${scaledWidth}:${scaledHeight}:force_original_aspect_ratio=decrease,pad=${scaledWidth}:${scaledHeight}:(ow-iw)/2:(oh-ih)/2:black,zoompan=z='min(zoom+${zoomSpeed.toFixed(6)},${endZoom})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${Math.round(duration * fps)}:s=${width}x${height}`
+      
+      let videoFilter = kenBurnsFilter
       
       if (segment.textOverlay) {
         // Escape text for FFmpeg drawtext filter
-        // Replace special characters that break shell/FFmpeg parsing
         const escapedText = segment.textOverlay
           .replace(/\\/g, '\\\\')
           .replace(/:/g, '\\:')
@@ -119,11 +144,22 @@ app.post('/render', async (req: Request, res: Response) => {
           .replace(/\{/g, '\\{')
           .replace(/\}/g, '\\}')
         
-        const fontSize = segment.type === 'cta' ? 72 : segment.type === 'opener' ? 56 : 48
-        const yPosition = segment.type === 'cta' ? 'h-th-150' : segment.type === 'opener' ? '100' : '80'
+        // Determine font size and position based on segment type
+        const fontSize = segment.type === 'cta' ? 72 : segment.type === 'opener' ? 64 : 52
+        const yPosition = segment.type === 'cta' ? 'h-th-150' : segment.type === 'opener' ? '100' : '120'
         
-        // Use escaped text in drawtext filter
-        const textFilter = `drawtext=text='${escapedText}':fontsize=${fontSize}:fontcolor=white:x=(w-text_w)/2:y=${yPosition}:box=1:boxcolor=black@0.5:boxborderw=5`
+        // Use textTiming if provided, otherwise show for entire duration
+        const textStart = segment.textTiming?.start ?? 0
+        const textDuration = segment.textTiming?.duration ?? duration
+        const textEnd = Math.min(textStart + textDuration, duration) // Don't exceed clip duration
+        
+        // Log text timing for debugging
+        console.log(`[${jobId}] Segment ${i} text overlay: "${escapedText.substring(0, 30)}..." timing: ${textStart}s-${textEnd}s (duration: ${textDuration}s)`)
+        
+        // Use escaped text in drawtext filter with timing
+        // enable='between(t,start,end)' controls when text appears
+        // Make text more visible with better styling (thicker border, darker background, larger font)
+        const textFilter = `drawtext=text='${escapedText}':fontsize=${fontSize}:fontcolor=white:x=(w-text_w)/2:y=${yPosition}:box=1:boxcolor=black@0.8:boxborderw=10:enable='between(t,${textStart},${textEnd})'`
         videoFilter += `,${textFilter}`
       }
 
@@ -288,7 +324,8 @@ function buildTransitionFilter(
   
   // Scale all inputs
   for (let i = 0; i < numClips; i++) {
-    filters.push(`[${i}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1[v${i}]`)
+    // Scale to fit vertical format while showing whole car (no cropping)
+    filters.push(`[${i}:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1[v${i}]`)
   }
   
   // Apply transitions
