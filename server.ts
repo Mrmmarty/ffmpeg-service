@@ -221,8 +221,9 @@ app.post('/render', async (req: Request, res: Response) => {
       // z='zoom+0.0005' means zoom increases by 0.0005 per frame
       // Use high-quality scaling algorithm (lanczos for better quality)
       // force_original_aspect_ratio=decrease ensures whole image is visible
-      // pad adds black borders if needed to maintain aspect ratio
-      const kenBurnsFilter = `scale=${scaledWidth}:${scaledHeight}:flags=lanczos:force_original_aspect_ratio=decrease,pad=${scaledWidth}:${scaledHeight}:(ow-iw)/2:(oh-ih)/2:black,zoompan=z='min(zoom+${zoomSpeed.toFixed(6)},${endZoom})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${Math.round(duration * fps)}:s=${width}x${height}`
+      // Use smart crop: scale to fill, then crop center (no black bars!)
+      // This fills the vertical frame instead of padding with black bars
+      const kenBurnsFilter = `scale=${scaledWidth}:${scaledHeight}:flags=lanczos:force_original_aspect_ratio=increase,crop=${scaledWidth}:${scaledHeight}:(iw-ow)/2:(ih-oh)/2,zoompan=z='min(zoom+${zoomSpeed.toFixed(6)},${endZoom})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${Math.round(duration * fps)}:s=${width}x${height}`
       
       let videoFilter = kenBurnsFilter
       
@@ -269,11 +270,11 @@ app.post('/render', async (req: Request, res: Response) => {
         '-t', duration.toString(),
         '-vf', videoFilter,
         '-c:v', 'libx264',
-        '-preset', 'medium', // Balanced speed/quality
-        '-crf', '23', // Balanced quality (was 20, too high for Railway memory limits)
+        '-preset', 'fast', // Faster encoding to avoid Railway memory limits (medium was causing OOM)
+        '-crf', '23', // Balanced quality (23 is good, 20 was too memory-intensive)
         '-pix_fmt', 'yuv420p',
         '-r', fps.toString(),
-        '-threads', '2', // Limit threads to reduce memory
+        '-threads', '1', // Reduce to 1 thread to save memory (Railway was killing with 2)
         '-movflags', '+faststart', // Enable fast start for web playback
         clipPath,
       ]
@@ -312,11 +313,11 @@ app.post('/render', async (req: Request, res: Response) => {
         '-filter_complex', filterComplex,
         '-map', '[v]',
         '-c:v', 'libx264',
-        '-preset', 'medium', // Better quality encoding
-        '-crf', '23', // Balanced quality (was 20, too high for Railway memory)
+        '-preset', 'fast', // Faster encoding to avoid Railway memory limits (medium was causing OOM)
+        '-crf', '23', // Balanced quality (23 is good, 20 was too memory-intensive)
         '-pix_fmt', 'yuv420p',
         '-r', fps.toString(),
-        '-threads', '2', // Limit threads to reduce memory
+        '-threads', '1', // Reduce to 1 thread to save memory (Railway was killing with 2)
         '-movflags', '+faststart', // Enable fast start for web playback
         finalVideoPath,
       ]
@@ -411,7 +412,8 @@ function buildTransitionFilter(
   for (let i = 0; i < numClips; i++) {
     // Scale to fit vertical format while showing whole car (no cropping)
     // Use high-quality scaling for concatenation
-    filters.push(`[${i}:v]scale=1080:1920:flags=lanczos:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1[v${i}]`)
+    // Use smart crop: scale to fill, then crop center (no black bars!)
+    filters.push(`[${i}:v]scale=1080:1920:flags=lanczos:force_original_aspect_ratio=increase,crop=1080:1920:(iw-ow)/2:(ih-oh)/2,setsar=1[v${i}]`)
   }
   
   // Apply transitions
