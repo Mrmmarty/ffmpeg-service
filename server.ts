@@ -103,18 +103,35 @@ app.post('/render', async (req: Request, res: Response) => {
   const jobId = uuidv4()
   const workDir = `/tmp/ffmpeg-${jobId}`
   
+  // Return immediately to avoid Railway timeout, process in background
+  res.status(202).json({
+    success: true,
+    jobId,
+    message: 'Video rendering started',
+    statusUrl: `/status/${jobId}`,
+  })
+  
+  // Process video in background (don't await)
+  processVideoAsync(jobId, workDir, req.body).catch(error => {
+    console.error(`[${jobId}] Background processing error:`, error)
+  })
+})
+
+async function processVideoAsync(jobId: string, workDir: string, body: any) {
   try {
     // Create work directory
     await mkdir(workDir, { recursive: true })
 
-    const { segments, audioUrl, carData, options } = req.body
+    const { segments, audioUrl, carData, options, callbackUrl } = body
 
     if (!segments || !Array.isArray(segments) || segments.length === 0) {
-      return res.status(400).json({ error: 'Segments array is required' })
+      console.error(`[${jobId}] Error: Segments array is required`)
+      return
     }
 
     if (!audioUrl) {
-      return res.status(400).json({ error: 'audioUrl is required' })
+      console.error(`[${jobId}] Error: audioUrl is required`)
+      return
     }
 
     const transitionType = options?.transitionType || 'crossfade'
@@ -301,34 +318,67 @@ app.post('/render', async (req: Request, res: Response) => {
     if (segments.length === 1) {
       // Single clip, no transition needed
       await execAsync(`cp "${clipPaths[0]}" "${finalVideoPath}"`)
+    } else if (transitionType === 'none' || clipPaths.length > 10) {
+      // Use concat demuxer for faster concatenation (no transitions)
+      // This is much faster than filter_complex and avoids Railway timeouts
+      const concatListPath = path.join(workDir, 'concat-list.txt')
+      const concatList = clipPaths.map(clip => `file '${clip}'`).join('\n')
+      await writeFile(concatListPath, concatList)
+      
+      const concatArgs = [
+        '-y',
+        '-f', 'concat',
+        '-safe', '0',
+        '-i', concatListPath,
+        '-c', 'copy', // Copy streams (no re-encoding = much faster!)
+        '-movflags', '+faststart',
+        finalVideoPath,
+      ]
+
+      try {
+        console.log(`[${jobId}] Starting fast concatenation (no transitions) with ${clipPaths.length} clips...`)
+        await execFFmpeg(concatArgs, workDir, jobId, 60000) // 1 min timeout (much faster!)
+        console.log(`[${jobId}] ✓ Concatenation complete: ${finalVideoPath}`)
+      } catch (error) {
+        console.error(`[${jobId}] Error concatenating clips:`, error)
+        throw new Error(`Failed to concatenate clips: ${error instanceof Error ? error.message : 'Unknown error'}`)
+      }
     } else {
-      // Multiple clips - use xfade filter for transitions
+      // Use xfade filter for transitions (only for small number of clips)
       const segmentDurations = segments.map(s => s.duration || 3)
       const filterComplex = buildTransitionFilter(clipPaths, transitionType, transitionDuration, fps, segmentDurations)
       
-      // Build concatenation command using array format (no shell escaping needed)
       const concatArgs = [
         '-y',
         ...clipPaths.flatMap((clip, i) => ['-i', clip]),
         '-filter_complex', filterComplex,
         '-map', '[v]',
         '-c:v', 'libx264',
-        '-preset', 'fast', // Faster encoding to avoid Railway memory limits (medium was causing OOM)
-        '-crf', '23', // Balanced quality (23 is good, 20 was too memory-intensive)
+        '-preset', 'ultrafast', // Use ultrafast for Railway (was 'fast')
+        '-crf', '23',
         '-pix_fmt', 'yuv420p',
         '-r', fps.toString(),
-        '-threads', '1', // Reduce to 1 thread to save memory (Railway was killing with 2)
-        '-movflags', '+faststart', // Enable fast start for web playback
+        '-threads', '1',
+        '-movflags', '+faststart',
         finalVideoPath,
       ]
 
       try {
-        console.log(`[${jobId}] Starting concatenation with ${clipPaths.length} clips...`)
-        await execFFmpeg(concatArgs, workDir, jobId, 300000) // 5 min timeout for concatenation
+        console.log(`[${jobId}] Starting concatenation with transitions (${clipPaths.length} clips)...`)
+        await execFFmpeg(concatArgs, workDir, jobId, 180000) // 3 min timeout (reduced from 5)
         console.log(`[${jobId}] ✓ Concatenation complete: ${finalVideoPath}`)
       } catch (error) {
         console.error(`[${jobId}] Error concatenating clips:`, error)
-        throw new Error(`Failed to concatenate clips: ${error instanceof Error ? error.message : 'Unknown error'}`)
+        // Fallback to simple concat if transitions fail
+        console.log(`[${jobId}] Falling back to simple concatenation...`)
+        const concatListPath = path.join(workDir, 'concat-list.txt')
+        const concatList = clipPaths.map(clip => `file '${clip}'`).join('\n')
+        await writeFile(concatListPath, concatList)
+        await execFFmpeg([
+          '-y', '-f', 'concat', '-safe', '0', '-i', concatListPath,
+          '-c', 'copy', '-movflags', '+faststart', finalVideoPath,
+        ], workDir, jobId, 60000)
+        console.log(`[${jobId}] ✓ Fallback concatenation complete`)
       }
     }
 
@@ -365,17 +415,34 @@ app.post('/render', async (req: Request, res: Response) => {
 
     console.log(`[${jobId}] Video render complete: ${finalVideo.length} bytes`)
 
-    // Return video as base64 or upload to storage
-    // For now, return as base64 (in production, upload to S3/Blob storage)
-    const videoBase64 = finalVideo.toString('base64')
-    const videoDataUrl = `data:video/mp4;base64,${videoBase64}`
-
-    res.json({
-      success: true,
-      videoUrl: videoDataUrl,
-      videoSize: finalVideo.length,
-      duration: segments.reduce((sum, s) => sum + (s.duration || 3), 0),
-    })
+    // Upload to blob storage if callback URL provided, otherwise return as base64
+    let videoUrl: string
+    if (callbackUrl) {
+      // Upload to blob storage via callback
+      const videoBase64 = finalVideo.toString('base64')
+      const response = await fetch(callbackUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jobId,
+          success: true,
+          videoBase64,
+          videoSize: finalVideo.length,
+          duration: segments.reduce((sum, s) => sum + (s.duration || 3), 0),
+        }),
+      })
+      if (!response.ok) {
+        throw new Error(`Callback failed: ${response.status}`)
+      }
+      const result = await response.json()
+      videoUrl = result.videoUrl
+      console.log(`[${jobId}] ✓ Video uploaded to blob storage: ${videoUrl}`)
+    } else {
+      // Fallback: return as base64 data URL
+      const videoBase64 = finalVideo.toString('base64')
+      videoUrl = `data:video/mp4;base64,${videoBase64}`
+      console.log(`[${jobId}] ✓ Video ready as base64 (${Math.round(videoBase64.length / 1024)}KB)`)
+    }
   } catch (error) {
     console.error(`[${jobId}] Render error:`, error)
     
@@ -386,12 +453,24 @@ app.post('/render', async (req: Request, res: Response) => {
       console.error(`[${jobId}] Cleanup error:`, cleanupError)
     }
 
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : 'Unknown error',
-    })
+    // Call callback with error if provided
+    if (body.callbackUrl) {
+      try {
+        await fetch(body.callbackUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            jobId,
+            success: false,
+            error: error instanceof Error ? error.message : 'Unknown error',
+          }),
+        })
+      } catch (callbackError) {
+        console.error(`[${jobId}] Callback error:`, callbackError)
+      }
+    }
   }
-})
+}
 
 /**
  * Build FFmpeg filter complex for transitions
