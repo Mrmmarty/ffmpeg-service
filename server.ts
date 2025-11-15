@@ -103,24 +103,57 @@ app.post('/render', async (req: Request, res: Response) => {
   const jobId = uuidv4()
   const workDir = `/tmp/ffmpeg-${jobId}`
   
-  // Return immediately to avoid Railway timeout, process in background
-  res.status(202).json({
+  // Use chunked transfer encoding to keep connection alive
+  // This prevents Railway from killing the process
+  res.writeHead(200, {
+    'Content-Type': 'application/json',
+    'Transfer-Encoding': 'chunked',
+    'Connection': 'keep-alive',
+  })
+  
+  // Send initial response
+  res.write(JSON.stringify({
     success: true,
     jobId,
     message: 'Video rendering started',
-    statusUrl: `/status/${jobId}`,
-  })
+    status: 'processing',
+  }) + '\n')
   
-  // Process video in background (don't await)
-  processVideoAsync(jobId, workDir, req.body).catch(error => {
-    console.error(`[${jobId}] Background processing error:`, error)
-  })
+  // Process video and stream updates
+  try {
+    const result = await processVideoAsync(jobId, workDir, req.body, (update) => {
+      // Send progress updates to keep connection alive
+      res.write(JSON.stringify(update) + '\n')
+    })
+    
+    // Send final result
+    res.write(JSON.stringify({
+      success: true,
+      ...result,
+      status: 'completed',
+    }) + '\n')
+    res.end()
+  } catch (error) {
+    res.write(JSON.stringify({
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error',
+      status: 'failed',
+    }) + '\n')
+    res.end()
+  }
 })
 
-async function processVideoAsync(jobId: string, workDir: string, body: any) {
+async function processVideoAsync(
+  jobId: string, 
+  workDir: string, 
+  body: any,
+  onProgress?: (update: any) => void
+) {
   try {
     // Create work directory
     await mkdir(workDir, { recursive: true })
+    
+    onProgress?.({ stage: 'initializing', progress: 0 })
 
     const { segments, audioUrl, carData, options, callbackUrl } = body
 
@@ -157,37 +190,54 @@ async function processVideoAsync(jobId: string, workDir: string, body: any) {
     console.log(`[${jobId}] Dimensions: ${width}x${height}, FPS: ${fps}`)
     console.log(`[${jobId}] ====================================`)
 
-    // Step 1: Download images
+    // Step 1: Download images (in parallel batches to speed up)
     console.log(`[${jobId}] Downloading ${segments.length} images...`)
+    onProgress?.({ stage: 'downloading_images', progress: 5 })
+    
     const imagePaths: string[] = []
+    const downloadPromises: Promise<void>[] = []
+    
+    // Download images in parallel (batch of 5 at a time to avoid overwhelming)
+    const batchSize = 5
     for (let i = 0; i < segments.length; i++) {
       const segment = segments[i]
       const imagePath = path.join(workDir, `image-${i}.jpg`)
+      imagePaths.push(imagePath) // Reserve slot
       
-      console.log(`[${jobId}] Downloading segment ${i + 1}/${segments.length}: ${segment.imageUrl?.substring(0, 70) || 'NO URL'}...`)
+      const downloadPromise = (async () => {
+        try {
+          if (!segment.imageUrl) {
+            throw new Error(`Segment ${i} has no imageUrl`)
+          }
+          const response = await fetch(segment.imageUrl)
+          if (!response.ok) {
+            throw new Error(`Failed to download image ${i}: ${response.status}`)
+          }
+          const buffer = await response.arrayBuffer()
+          await writeFile(imagePath, Buffer.from(buffer))
+          console.log(`[${jobId}] ✓ Downloaded image ${i + 1}/${segments.length}`)
+          onProgress?.({ stage: 'downloading_images', progress: 5 + Math.round((i + 1) / segments.length * 10) })
+        } catch (error) {
+          console.error(`[${jobId}] Error downloading image ${i}:`, error)
+          throw new Error(`Failed to download image ${i}: ${error instanceof Error ? error.message : 'Unknown error'}`)
+        }
+      })()
       
-      try {
-        if (!segment.imageUrl) {
-          throw new Error(`Segment ${i} has no imageUrl`)
-        }
-        const response = await fetch(segment.imageUrl)
-        if (!response.ok) {
-          throw new Error(`Failed to download image ${i}: ${response.status}`)
-        }
-        const buffer = await response.arrayBuffer()
-        await writeFile(imagePath, Buffer.from(buffer))
-        imagePaths.push(imagePath)
-        console.log(`[${jobId}] ✓ Downloaded image ${i + 1}: ${imagePath}`)
-      } catch (error) {
-        console.error(`[${jobId}] Error downloading image ${i}:`, error)
-        throw new Error(`Failed to download image ${i}: ${error instanceof Error ? error.message : 'Unknown error'}`)
+      downloadPromises.push(downloadPromise)
+      
+      // Process in batches
+      if (downloadPromises.length >= batchSize || i === segments.length - 1) {
+        await Promise.all(downloadPromises)
+        downloadPromises.length = 0 // Clear array
       }
     }
     
     console.log(`[${jobId}] Downloaded ${imagePaths.length} images successfully`)
+    onProgress?.({ stage: 'images_downloaded', progress: 15 })
 
     // Step 2: Download audio
     console.log(`[${jobId}] Downloading audio...`)
+    onProgress?.({ stage: 'downloading_audio', progress: 20 })
     const audioPath = path.join(workDir, 'audio.mp3')
     try {
       const audioResponse = await fetch(audioUrl)
@@ -196,6 +246,7 @@ async function processVideoAsync(jobId: string, workDir: string, body: any) {
       }
       const audioBuffer = await audioResponse.arrayBuffer()
       await writeFile(audioPath, Buffer.from(audioBuffer))
+      onProgress?.({ stage: 'audio_downloaded', progress: 25 })
     } catch (error) {
       console.error(`[${jobId}] Error downloading audio:`, error)
       throw new Error(`Failed to download audio: ${error instanceof Error ? error.message : 'Unknown error'}`)
@@ -203,9 +254,11 @@ async function processVideoAsync(jobId: string, workDir: string, body: any) {
 
     // Step 3: Create video clips from images with text overlays
     console.log(`[${jobId}] Creating ${segments.length} video clips from ${imagePaths.length} images...`)
+    onProgress?.({ stage: 'creating_clips', progress: 30 })
     const clipPaths: string[] = []
     
     for (let i = 0; i < segments.length; i++) {
+      onProgress?.({ stage: 'creating_clips', progress: 30 + Math.round((i / segments.length) * 20) })
       const segment = segments[i]
       console.log(`[${jobId}] Processing segment ${i + 1}/${segments.length}: ${segment.imageUrl?.substring(0, 70) || 'NO URL'}...`)
       
@@ -310,9 +363,11 @@ async function processVideoAsync(jobId: string, workDir: string, body: any) {
     if (clipPaths.length !== segments.length) {
       console.warn(`[${jobId}] WARNING: Clip count mismatch! Expected ${segments.length}, got ${clipPaths.length}`)
     }
+    onProgress?.({ stage: 'clips_created', progress: 50 })
 
     // Step 4: Concatenate clips with transitions
     console.log(`[${jobId}] Concatenating clips with ${transitionType} transitions...`)
+    onProgress?.({ stage: 'concatenating', progress: 55 })
     const finalVideoPath = path.join(workDir, 'final.mp4')
 
     if (segments.length === 1) {
@@ -339,6 +394,7 @@ async function processVideoAsync(jobId: string, workDir: string, body: any) {
         console.log(`[${jobId}] Starting fast concatenation (no transitions) with ${clipPaths.length} clips...`)
         await execFFmpeg(concatArgs, workDir, jobId, 60000) // 1 min timeout (much faster!)
         console.log(`[${jobId}] ✓ Concatenation complete: ${finalVideoPath}`)
+        onProgress?.({ stage: 'concatenated', progress: 70 })
       } catch (error) {
         console.error(`[${jobId}] Error concatenating clips:`, error)
         throw new Error(`Failed to concatenate clips: ${error instanceof Error ? error.message : 'Unknown error'}`)
@@ -384,6 +440,7 @@ async function processVideoAsync(jobId: string, workDir: string, body: any) {
 
     // Step 5: Add audio
     console.log(`[${jobId}] Adding audio track...`)
+    onProgress?.({ stage: 'adding_audio', progress: 75 })
     const videoWithAudioPath = path.join(workDir, 'video-with-audio.mp4')
     
     const audioArgs = [
@@ -402,46 +459,30 @@ async function processVideoAsync(jobId: string, workDir: string, body: any) {
     try {
       await execFFmpeg(audioArgs, workDir, jobId, 60000) // 1 min timeout for audio merge
       console.log(`[${jobId}] ✓ Audio added: ${videoWithAudioPath}`)
+      onProgress?.({ stage: 'audio_added', progress: 85 })
     } catch (error) {
       console.error(`[${jobId}] Error adding audio:`, error)
       throw new Error(`Failed to add audio: ${error instanceof Error ? error.message : 'Unknown error'}`)
     }
 
     // Step 6: Read final video
+    onProgress?.({ stage: 'reading_video', progress: 90 })
     const finalVideo = await readFile(videoWithAudioPath)
 
     // Step 7: Cleanup
     await cleanup(workDir)
 
     console.log(`[${jobId}] Video render complete: ${finalVideo.length} bytes`)
+    onProgress?.({ stage: 'complete', progress: 95 })
 
-    // Upload to blob storage if callback URL provided, otherwise return as base64
-    let videoUrl: string
-    if (callbackUrl) {
-      // Upload to blob storage via callback
-      const videoBase64 = finalVideo.toString('base64')
-      const response = await fetch(callbackUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jobId,
-          success: true,
-          videoBase64,
-          videoSize: finalVideo.length,
-          duration: segments.reduce((sum, s) => sum + (s.duration || 3), 0),
-        }),
-      })
-      if (!response.ok) {
-        throw new Error(`Callback failed: ${response.status}`)
-      }
-      const result = await response.json()
-      videoUrl = result.videoUrl
-      console.log(`[${jobId}] ✓ Video uploaded to blob storage: ${videoUrl}`)
-    } else {
-      // Fallback: return as base64 data URL
-      const videoBase64 = finalVideo.toString('base64')
-      videoUrl = `data:video/mp4;base64,${videoBase64}`
-      console.log(`[${jobId}] ✓ Video ready as base64 (${Math.round(videoBase64.length / 1024)}KB)`)
+    // Return video as base64 (client will upload to blob storage)
+    const videoBase64 = finalVideo.toString('base64')
+    const videoDataUrl = `data:video/mp4;base64,${videoBase64}`
+    
+    return {
+      videoUrl: videoDataUrl,
+      videoSize: finalVideo.length,
+      duration: segments.reduce((sum, s) => sum + (s.duration || 3), 0),
     }
   } catch (error) {
     console.error(`[${jobId}] Render error:`, error)
@@ -453,22 +494,7 @@ async function processVideoAsync(jobId: string, workDir: string, body: any) {
       console.error(`[${jobId}] Cleanup error:`, cleanupError)
     }
 
-    // Call callback with error if provided
-    if (body.callbackUrl) {
-      try {
-        await fetch(body.callbackUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            jobId,
-            success: false,
-            error: error instanceof Error ? error.message : 'Unknown error',
-          }),
-        })
-      } catch (callbackError) {
-        console.error(`[${jobId}] Callback error:`, callbackError)
-      }
-    }
+    throw error // Re-throw to be caught by caller
   }
 }
 
