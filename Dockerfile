@@ -1,11 +1,15 @@
 # FFmpeg Video Rendering Service
 FROM node:18-slim
 
-# Install FFmpeg and optimize for memory usage
+# Install FFmpeg and modern fonts
 RUN apt-get update && apt-get install -y \
-    ffmpeg \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
+  ffmpeg \
+  fonts-dejavu-core \
+  fonts-liberation \
+  fonts-noto-core \
+  fonts-noto-color-emoji \
+  && rm -rf /var/lib/apt/lists/* \
+  && apt-get clean
 
 # Set Node.js memory limit to leave room for FFmpeg
 ENV NODE_OPTIONS="--max-old-space-size=512"

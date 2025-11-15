@@ -149,6 +149,8 @@ async function processVideoAsync(
   body: any,
   onProgress?: (update: any) => void
 ) {
+  let finalVideoPath: string // Will be set during processing
+  let actualAudioDuration: number = 0 // Will be set during processing
   try {
     // Create work directory
     await mkdir(workDir, { recursive: true })
@@ -268,44 +270,71 @@ async function processVideoAsync(
       const segment = segments[i]
       console.log(`[${jobId}] Processing segment ${i + 1}/${segments.length}: ${segment.imageUrl?.substring(0, 70) || 'NO URL'}...`)
       
-      // Process image to fit vertical format (1080x1920) - show whole car
-      // Use scale and crop to maintain aspect ratio while fitting vertical format
+      // Process image to fit vertical format (1080x1920) - show MORE of the image
+      // Use scale with decrease + pad to show entire image (no cropping)
+      // This is especially important for 3:2 aspect ratio images
       const clipPath = path.join(workDir, `clip-${i}.mp4`)
       const duration = segment.duration || 3
       
-      // Build FFmpeg filter - scale to fit vertical format while showing whole car
-      // Use scale with fit to maintain aspect ratio and show entire image
-      // This ensures we see the whole car, not cropped
-      // Add Ken Burns effect (slow zoom/pan) for dynamic movement
-      
-      // Ken Burns parameters:
-      // - Start zoom: 1.0 (no zoom)
-      // - End zoom: 1.1 (10% zoom in)
-      // - Pan: slight movement (optional)
+      // KEN BURNS EFFECT - ALWAYS APPLIED (user requirement: NO STATIC IMAGES)
+      // Use ONLY zoompan filter for reliable, smooth zoom effect
+      // Simplified implementation that always works
       const startZoom = 1.0
-      const endZoom = 1.1
-      const zoomSpeed = (endZoom - startZoom) / (duration * fps) // Increment per frame
+      const endZoom = 1.12 // 12% zoom in (subtle, professional)
+      const zoomSpeed = (endZoom - startZoom) / (duration * fps)
       
-      // Scale image larger first to allow zoom room (scale to 120% to allow zoom to 110%)
+      // Scale image larger to allow zoom room, then apply zoompan
+      // Use decrease+pad to show MORE of the image (especially for 3:2 images)
+      // Scale to 120% to allow zoom without showing edges
       const scaleFactor = 1.2
       const scaledWidth = Math.round(width * scaleFactor)
       const scaledHeight = Math.round(height * scaleFactor)
       
-      // Step 1: Scale image larger with padding (to allow zoom room)
-      // Step 2: Apply Ken Burns zoom effect
-      // zoompan syntax: z='zoom+increment':d=duration_in_frames:s=output_size
-      // z='zoom+0.0005' means zoom increases by 0.0005 per frame
-      // Use high-quality scaling algorithm (lanczos for better quality)
-      // force_original_aspect_ratio=decrease ensures whole image is visible
-      // Use smart crop: scale to fill, then crop center (no black bars!)
-      // This fills the vertical frame instead of padding with black bars
-      const kenBurnsFilter = `scale=${scaledWidth}:${scaledHeight}:flags=lanczos:force_original_aspect_ratio=increase,crop=${scaledWidth}:${scaledHeight}:(iw-ow)/2:(ih-oh)/2,zoompan=z='min(zoom+${zoomSpeed.toFixed(6)},${endZoom})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${Math.round(duration * fps)}:s=${width}x${height}`
+      // First scale and pad to show full image (no cropping), then zoom
+      // This ensures 3:2 images show more content instead of being cut off
+      const kenBurnsFilter = `scale=${scaledWidth}:${scaledHeight}:flags=lanczos:force_original_aspect_ratio=decrease,pad=${scaledWidth}:${scaledHeight}:(ow-iw)/2:(oh-ih)/2:black,zoompan=z='min(zoom+${zoomSpeed.toFixed(6)},${endZoom})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${Math.round(duration * fps)}:s=${width}x${height}`
+      
+      console.log(`[${jobId}] Segment ${i + 1}: Applying Ken Burns zoom effect (${startZoom.toFixed(2)}x → ${endZoom.toFixed(2)}x over ${duration.toFixed(2)}s)`)
       
       let videoFilter = kenBurnsFilter
       
       if (segment.textOverlay) {
+        // SMART TEXT OVERLAY THAT ALWAYS FITS THE FRAME
+        // Simple, reliable approach: Fixed font sizes with character limits
+        let fontSize: number
+        let maxCharsPerLine: number
+        
+        if (segment.type === 'opener') {
+          fontSize = 42 // Readable but not too large
+          maxCharsPerLine = 30 // ~30 chars fit at 42px on 1080px width
+        } else if (segment.type === 'cta') {
+          fontSize = 52 // Larger for call-to-action
+          maxCharsPerLine = 25 // ~25 chars fit at 52px
+        } else {
+          fontSize = 38 // Standard for features
+          maxCharsPerLine = 32 // ~32 chars fit at 38px
+        }
+        
+        // Wrap text to fit character limit per line
+        const wrappedText = wrapTextSimple(segment.textOverlay, maxCharsPerLine)
+        const lines = wrappedText.split('\n')
+        const maxLineLength = Math.max(...lines.map(l => l.length))
+        
+        // Calculate line spacing and position
+        const lineSpacing = Math.max(8, Math.floor(fontSize * 0.2)) // 20% of font size
+        const totalTextHeight = (fontSize + lineSpacing) * lines.length - lineSpacing
+        let yPosition: string
+        
+        if (segment.type === 'opener') {
+          yPosition = '60' // Top area
+        } else if (segment.type === 'cta') {
+          yPosition = 'h-th-150' // Bottom area
+        } else {
+          yPosition = '100' // Middle-top area
+        }
+        
         // Escape text for FFmpeg drawtext filter
-        const escapedText = segment.textOverlay
+        const escapedText = wrappedText
           .replace(/\\/g, '\\\\')
           .replace(/:/g, '\\:')
           .replace(/'/g, "\\'")
@@ -316,23 +345,53 @@ async function processVideoAsync(
           .replace(/\]/g, '\\]')
           .replace(/\{/g, '\\{')
           .replace(/\}/g, '\\}')
-        
-        // Determine font size and position based on segment type
-        const fontSize = segment.type === 'cta' ? 72 : segment.type === 'opener' ? 64 : 52
-        const yPosition = segment.type === 'cta' ? 'h-th-150' : segment.type === 'opener' ? '100' : '120'
+          .replace(/\n/g, '\\n') // Escape newlines for FFmpeg
         
         // Use textTiming if provided, otherwise show for entire duration
         const textStart = segment.textTiming?.start ?? 0
         const textDuration = segment.textTiming?.duration ?? duration
-        const textEnd = Math.min(textStart + textDuration, duration) // Don't exceed clip duration
+        const textEnd = Math.min(textStart + textDuration, duration)
         
-        // Log text timing for debugging
-        console.log(`[${jobId}] Segment ${i} text overlay: "${escapedText.substring(0, 30)}..." timing: ${textStart}s-${textEnd}s (duration: ${textDuration}s)`)
+        // Log text timing and sizing for debugging
+        console.log(`[${jobId}] Segment ${i} text overlay: "${wrappedText.substring(0, 60).replace(/\n/g, ' | ')}..." (${lines.length} lines, ${maxLineLength} chars/line, font: ${fontSize}px) timing: ${textStart}s-${textEnd}s`)
         
-        // Use escaped text in drawtext filter with timing
-        // enable='between(t,start,end)' controls when text appears
-        // Make text more visible with better styling (thicker border, darker background, larger font)
-        const textFilter = `drawtext=text='${escapedText}':fontsize=${fontSize}:fontcolor=white:x=(w-text_w)/2:y=${yPosition}:box=1:boxcolor=black@0.8:boxborderw=10:enable='between(t,${textStart},${textEnd})'`
+        // Use modern font (DejaVu Sans Bold for clean, modern look)
+        // Modern fonts installed in Docker: DejaVu Sans, Liberation Sans, Noto Sans
+        const fontPaths = [
+          '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', // DejaVu Sans Bold (modern, clean, bold)
+          '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf', // Liberation Sans Bold (fallback)
+          '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', // DejaVu Sans Regular (fallback)
+        ]
+        
+        // Check which font is available (for local dev vs Docker)
+        let fontfileParam = ''
+        try {
+          // Try to find an available font
+          for (const fontPath of fontPaths) {
+            if (existsSync(fontPath)) {
+              // Escape font path for FFmpeg (escape colons and special chars)
+              const escapedFontPath = fontPath.replace(/:/g, '\\:').replace(/'/g, "\\'")
+              fontfileParam = `fontfile='${escapedFontPath}':`
+              console.log(`[${jobId}] Using modern font: ${fontPath}`)
+              break
+            }
+          }
+          // If no font found, FFmpeg will use system default (still modern on most systems)
+          if (!fontfileParam) {
+            console.log(`[${jobId}] No custom font found, using FFmpeg default font`)
+          }
+        } catch (error) {
+          // If font check fails, use default (FFmpeg will handle it)
+          console.log(`[${jobId}] Font check failed, using default`)
+        }
+        
+        // Use drawtext with modern font and manual wrapping (newlines) to ensure text fits frame
+        // fix_bounds=1 ensures text doesn't go outside frame boundaries
+        // x=(w-text_w)/2 centers horizontally using actual text width
+        // box=1 creates background box that scales with text
+        // line_spacing controls spacing between wrapped lines
+        // fontfile uses modern DejaVu Sans Bold for clean, professional look
+        const textFilter = `drawtext=${fontfileParam}text='${escapedText}':fontsize=${fontSize}:fontcolor=white:x=(w-text_w)/2:y=${yPosition}:box=1:boxcolor=black@0.85:boxborderw=14:fix_bounds=1:line_spacing=${lineSpacing}:enable='between(t,${textStart},${textEnd})'`
         videoFilter += `,${textFilter}`
       }
 
@@ -371,10 +430,12 @@ async function processVideoAsync(
       }
     }
     
-    console.log(`[${jobId}] Created ${clipPaths.length} clips (expected ${segments.length})`)
+    console.log(`[${jobId}] ✓ Created ${clipPaths.length} clips (expected ${segments.length})`)
     if (clipPaths.length !== segments.length) {
       console.warn(`[${jobId}] WARNING: Clip count mismatch! Expected ${segments.length}, got ${clipPaths.length}`)
     }
+    console.log(`[${jobId}] ✓ Ken Burns effect applied to all ${clipPaths.length} clips (zoom 1.0x → 1.12x)`)
+    console.log(`[${jobId}] ✓ Image scaling: Using pad (no crop) to show more of images, especially 3:2 aspect ratio`)
     onProgress?.({ stage: 'clips_created', progress: 50 })
 
     // Step 4: Concatenate clips with transitions
@@ -450,21 +511,86 @@ async function processVideoAsync(
       }
     }
 
-    // Step 5: Add audio
+    // Step 5: Match video duration to audio duration exactly
+    console.log(`[${jobId}] Matching video duration to audio...`)
+    onProgress?.({ stage: 'matching_duration', progress: 75 })
+    
+    // Calculate actual video duration from segments
+    const calculatedVideoDuration = segments.reduce((sum, s) => sum + (s.duration || 0), 0)
+    
+    // Get actual audio duration using ffprobe - CRITICAL: Must succeed to prevent audio cutoff
+    try {
+      const probeResult = await execAsync(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${audioPath}"`)
+      const probedDuration = parseFloat(probeResult.stdout.trim())
+      
+      if (!probedDuration || isNaN(probedDuration) || probedDuration <= 0) {
+        throw new Error(`Invalid audio duration from ffprobe: ${probeResult.stdout.trim()}`)
+      }
+      
+      actualAudioDuration = probedDuration
+      console.log(`[${jobId}] ✓ Audio duration from ffprobe: ${actualAudioDuration.toFixed(2)}s, Video duration: ${calculatedVideoDuration.toFixed(2)}s`)
+    } catch (error) {
+      console.error(`[${jobId}] ❌ CRITICAL: Failed to probe audio duration:`, error)
+      throw new Error(`Failed to get audio duration - cannot proceed safely. Error: ${error instanceof Error ? error.message : 'Unknown error'}`)
+    }
+    
+    // Ensure video duration matches audio duration exactly
+    let videoForAudio = finalVideoPath
+    const durationDiff = actualAudioDuration - calculatedVideoDuration
+    
+    if (Math.abs(durationDiff) > 0.1) { // More than 0.1s difference
+      console.log(`[${jobId}] Duration mismatch: audio=${actualAudioDuration.toFixed(2)}s, video=${calculatedVideoDuration.toFixed(2)}s, diff=${durationDiff.toFixed(2)}s`)
+      
+      const matchedVideoPath = path.join(workDir, 'video-matched.mp4')
+      
+      if (durationDiff > 0) {
+        // Audio is longer - extend last frame to match audio
+        console.log(`[${jobId}] Extending video to match audio duration...`)
+        const extendArgs = [
+          '-y',
+          '-i', finalVideoPath,
+          '-t', actualAudioDuration.toFixed(3), // Set exact duration
+          '-c:v', 'libx264',
+          '-preset', 'ultrafast',
+          '-crf', '23',
+          '-pix_fmt', 'yuv420p',
+          matchedVideoPath,
+        ]
+        await execFFmpeg(extendArgs, workDir, jobId, 30000)
+        videoForAudio = matchedVideoPath
+      } else {
+        // Audio is shorter - trim video to match audio
+        console.log(`[${jobId}] Trimming video to match audio duration...`)
+        const trimArgs = [
+          '-y',
+          '-i', finalVideoPath,
+          '-t', actualAudioDuration.toFixed(3), // Set exact duration
+          '-c:v', 'copy', // Copy video stream (fast)
+          matchedVideoPath,
+        ]
+        await execFFmpeg(trimArgs, workDir, jobId, 30000)
+        videoForAudio = matchedVideoPath
+      }
+    }
+    
+    // Step 6: Add audio
     console.log(`[${jobId}] Adding audio track...`)
-    onProgress?.({ stage: 'adding_audio', progress: 75 })
+    onProgress?.({ stage: 'adding_audio', progress: 80 })
     const videoWithAudioPath = path.join(workDir, 'video-with-audio.mp4')
     
+    // CRITICAL FIX: Use exact duration matching instead of -shortest
+    // -shortest can cut off audio if there's any timing mismatch
+    // Instead, use -t to set exact duration from audio
     const audioArgs = [
       '-y',
-      '-i', finalVideoPath,
+      '-i', videoForAudio,
       '-i', audioPath,
       '-c:v', 'copy', // Copy video stream (no re-encoding)
       '-c:a', 'aac', // Encode audio to AAC
       '-b:a', '192k', // Audio bitrate
       '-map', '0:v:0',
       '-map', '1:a:0',
-      '-shortest', // End when shortest stream ends
+      '-t', actualAudioDuration.toFixed(3), // Use exact audio duration (CRITICAL: prevents cut-off)
       videoWithAudioPath,
     ]
 
@@ -472,6 +598,26 @@ async function processVideoAsync(
       await execFFmpeg(audioArgs, workDir, jobId, 60000) // 1 min timeout for audio merge
       console.log(`[${jobId}] ✓ Audio added: ${videoWithAudioPath}`)
       onProgress?.({ stage: 'audio_added', progress: 85 })
+      
+      // VALIDATION: Verify final video has audio and correct duration - CRITICAL CHECK
+      try {
+        const verifyResult = await execAsync(`ffprobe -v error -show_entries format=duration,stream=codec_type -of default=noprint_wrappers=1 "${videoWithAudioPath}"`)
+        const hasAudio = verifyResult.stdout.includes('codec_type=audio')
+        const finalDuration = parseFloat(verifyResult.stdout.match(/duration=([\d.]+)/)?.[1] || '0')
+        
+        if (!hasAudio) {
+          throw new Error('CRITICAL: Final video has no audio track')
+        }
+        if (Math.abs(finalDuration - actualAudioDuration) > 0.3) {
+          // Allow 0.3s tolerance for encoding differences
+          throw new Error(`CRITICAL: Duration mismatch - expected ${actualAudioDuration.toFixed(2)}s, got ${finalDuration.toFixed(2)}s (diff: ${Math.abs(finalDuration - actualAudioDuration).toFixed(2)}s)`)
+        }
+        console.log(`[${jobId}] ✓ Validation passed: audio=${hasAudio}, duration=${finalDuration.toFixed(2)}s (expected: ${actualAudioDuration.toFixed(2)}s)`)
+      } catch (verifyError) {
+        console.error(`[${jobId}] ❌ CRITICAL VALIDATION FAILED:`, verifyError)
+        // Fail the job if validation fails - audio cutoff is unacceptable
+        throw new Error(`Video validation failed: ${verifyError instanceof Error ? verifyError.message : 'Unknown error'}`)
+      }
     } catch (error) {
       console.error(`[${jobId}] Error adding audio:`, error)
       throw new Error(`Failed to add audio: ${error instanceof Error ? error.message : 'Unknown error'}`)
@@ -491,10 +637,11 @@ async function processVideoAsync(
     const videoBase64 = finalVideo.toString('base64')
     const videoDataUrl = `data:video/mp4;base64,${videoBase64}`
     
+    // Use actual audio duration as the final video duration (more accurate)
     return {
       videoUrl: videoDataUrl,
       videoSize: finalVideo.length,
-      duration: segments.reduce((sum, s) => sum + (s.duration || 3), 0),
+      duration: actualAudioDuration || segments.reduce((sum, s) => sum + (s.duration || 3), 0),
     }
   } catch (error) {
     console.error(`[${jobId}] Render error:`, error)
@@ -508,6 +655,46 @@ async function processVideoAsync(
 
     throw error // Re-throw to be caught by caller
   }
+}
+
+/**
+ * Simple, reliable text wrapping at word boundaries
+ * Wraps text to fit within maxCharsPerLine
+ */
+function wrapTextSimple(text: string, maxCharsPerLine: number): string {
+  // If text already has newlines (like opener), wrap each line separately
+  if (text.includes('\n')) {
+    return text.split('\n').map(line => wrapLine(line, maxCharsPerLine)).join('\n')
+  }
+  
+  return wrapLine(text, maxCharsPerLine)
+}
+
+/**
+ * Wrap a single line at word boundaries
+ */
+function wrapLine(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text
+  
+  const words = text.split(' ')
+  const lines: string[] = []
+  let currentLine = ''
+  
+  for (const word of words) {
+    // If adding this word exceeds limit, start new line
+    if (currentLine && (currentLine + ' ' + word).length > maxChars) {
+      lines.push(currentLine)
+      currentLine = word
+    } else {
+      currentLine = currentLine ? currentLine + ' ' + word : word
+    }
+  }
+  
+  if (currentLine) {
+    lines.push(currentLine)
+  }
+  
+  return lines.join('\n')
 }
 
 /**
@@ -525,12 +712,12 @@ function buildTransitionFilter(
   // Build filter chain
   const filters: string[] = []
   
-  // Scale all inputs
+  // Scale all inputs - use pad instead of crop to show MORE of the image
   for (let i = 0; i < numClips; i++) {
-    // Scale to fit vertical format while showing whole car (no cropping)
-    // Use high-quality scaling for concatenation
-    // Use smart crop: scale to fill, then crop center (no black bars!)
-    filters.push(`[${i}:v]scale=1080:1920:flags=lanczos:force_original_aspect_ratio=increase,crop=1080:1920:(iw-ow)/2:(ih-oh)/2,setsar=1[v${i}]`)
+    // Scale to fit vertical format while showing whole image (no cropping)
+    // Use decrease+pad to show more content, especially for 3:2 images
+    // This matches the individual clip processing for consistency
+    filters.push(`[${i}:v]scale=1080:1920:flags=lanczos:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1[v${i}]`)
   }
   
   // Apply transitions
