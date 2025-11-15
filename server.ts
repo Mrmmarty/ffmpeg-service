@@ -549,7 +549,7 @@ async function processVideoAsync(
         const extendArgs = [
           '-y',
           '-i', finalVideoPath,
-          '-t', actualAudioDuration.toFixed(3), // Set exact duration
+          '-vf', `tpad=stop_mode=clone:stop_duration=${durationDiff.toFixed(3)}`, // Extend by cloning last frame
           '-c:v', 'libx264',
           '-preset', 'ultrafast',
           '-crf', '23',
