@@ -6,7 +6,7 @@
  */
 
 import express, { Request, Response } from 'express'
-import { exec } from 'child_process'
+import { exec, spawn } from 'child_process'
 import { promisify } from 'util'
 import { writeFile, mkdir, readFile } from 'fs/promises'
 import { existsSync } from 'fs'
@@ -14,6 +14,80 @@ import path from 'path'
 import { v4 as uuidv4 } from 'uuid'
 
 const execAsync = promisify(exec)
+
+/**
+ * Execute FFmpeg command with better error handling and progress logging
+ */
+async function execFFmpeg(args: string[], workDir: string, jobId: string, timeoutMs: number = 300000): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const ffmpeg = spawn('ffmpeg', args, {
+      cwd: workDir,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+
+    let stdout = ''
+    let stderr = ''
+    let hasOutput = false
+
+    ffmpeg.stdout?.on('data', (data) => {
+      const output = data.toString()
+      stdout += output
+      hasOutput = true
+      // Log progress lines (frame=...)
+      if (output.includes('frame=')) {
+        const lines = output.split('\n').filter((l: string) => l.includes('frame='))
+        if (lines.length > 0) {
+          console.log(`[${jobId}] ${lines[lines.length - 1].trim()}`)
+        }
+      }
+    })
+
+    ffmpeg.stderr?.on('data', (data) => {
+      const output = data.toString()
+      stderr += output
+      hasOutput = true
+      // FFmpeg writes progress to stderr
+      if (output.includes('frame=') || output.includes('time=')) {
+        const lines = output.split('\n').filter((l: string) => l.includes('frame=') || l.includes('time='))
+        if (lines.length > 0) {
+          console.log(`[${jobId}] ${lines[lines.length - 1].trim()}`)
+        }
+      }
+    })
+
+    const timeout = setTimeout(() => {
+      ffmpeg.kill('SIGTERM')
+      reject(new Error(`FFmpeg command timed out after ${timeoutMs}ms`))
+    }, timeoutMs)
+
+    ffmpeg.on('close', (code, signal) => {
+      clearTimeout(timeout)
+      
+      if (code === 0) {
+        resolve()
+      } else {
+        const errorMsg = signal 
+          ? `FFmpeg process killed by signal: ${signal}` 
+          : `FFmpeg exited with code ${code}`
+        
+        console.error(`[${jobId}] ${errorMsg}`)
+        if (stderr) {
+          console.error(`[${jobId}] FFmpeg stderr: ${stderr.slice(-1000)}`) // Last 1000 chars
+        }
+        if (stdout) {
+          console.error(`[${jobId}] FFmpeg stdout: ${stdout.slice(-1000)}`)
+        }
+        
+        reject(new Error(`${errorMsg}. ${hasOutput ? 'Check logs above for details.' : 'No output received.'}`))
+      }
+    })
+
+    ffmpeg.on('error', (error) => {
+      clearTimeout(timeout)
+      reject(new Error(`Failed to start FFmpeg: ${error.message}`))
+    })
+  })
+}
 const app = express()
 
 app.use(express.json({ limit: '50mb' }))
@@ -45,16 +119,26 @@ app.post('/render', async (req: Request, res: Response) => {
 
     const transitionType = options?.transitionType || 'crossfade'
     const transitionDuration = options?.transitionDuration || 0.5
+    // Higher resolution for better quality (4K vertical = 2160x3840, but use 1440x2560 for balance)
+    // Using 1080x1920 for now but ensure high quality input
     const width = options?.width || 1080
     const height = options?.height || 1920
     const fps = options?.fps || 30
+    // Ensure high quality encoding
+    const videoQuality = 'high'
 
-    console.log(`[${jobId}] Starting video render:`, {
-      segments: segments.length,
-      transitionType,
-      transitionDuration,
-      dimensions: `${width}x${height}`,
+    // Log what we received
+    const uniqueImageUrls = new Set(segments.map((s: any) => s.imageUrl))
+    console.log(`[${jobId}] ===== FFMPEG SERVICE RECEIVED =====`)
+    console.log(`[${jobId}] Total segments: ${segments.length}`)
+    console.log(`[${jobId}] Unique images: ${uniqueImageUrls.size}`)
+    console.log(`[${jobId}] Segment details:`)
+    segments.forEach((seg: any, idx: number) => {
+      console.log(`[${jobId}]   ${idx + 1}. ${seg.type} - ${seg.imageUrl?.substring(0, 70) || 'NO URL'}... (${seg.duration?.toFixed(2) || 'N/A'}s)`)
     })
+    console.log(`[${jobId}] Transition: ${transitionType}, Duration: ${transitionDuration}s`)
+    console.log(`[${jobId}] Dimensions: ${width}x${height}, FPS: ${fps}`)
+    console.log(`[${jobId}] ====================================`)
 
     // Step 1: Download images
     console.log(`[${jobId}] Downloading ${segments.length} images...`)
@@ -63,7 +147,12 @@ app.post('/render', async (req: Request, res: Response) => {
       const segment = segments[i]
       const imagePath = path.join(workDir, `image-${i}.jpg`)
       
+      console.log(`[${jobId}] Downloading segment ${i + 1}/${segments.length}: ${segment.imageUrl?.substring(0, 70) || 'NO URL'}...`)
+      
       try {
+        if (!segment.imageUrl) {
+          throw new Error(`Segment ${i} has no imageUrl`)
+        }
         const response = await fetch(segment.imageUrl)
         if (!response.ok) {
           throw new Error(`Failed to download image ${i}: ${response.status}`)
@@ -71,11 +160,14 @@ app.post('/render', async (req: Request, res: Response) => {
         const buffer = await response.arrayBuffer()
         await writeFile(imagePath, Buffer.from(buffer))
         imagePaths.push(imagePath)
+        console.log(`[${jobId}] ✓ Downloaded image ${i + 1}: ${imagePath}`)
       } catch (error) {
         console.error(`[${jobId}] Error downloading image ${i}:`, error)
         throw new Error(`Failed to download image ${i}: ${error instanceof Error ? error.message : 'Unknown error'}`)
       }
     }
+    
+    console.log(`[${jobId}] Downloaded ${imagePaths.length} images successfully`)
 
     // Step 2: Download audio
     console.log(`[${jobId}] Downloading audio...`)
@@ -93,11 +185,12 @@ app.post('/render', async (req: Request, res: Response) => {
     }
 
     // Step 3: Create video clips from images with text overlays
-    console.log(`[${jobId}] Creating video clips...`)
+    console.log(`[${jobId}] Creating ${segments.length} video clips from ${imagePaths.length} images...`)
     const clipPaths: string[] = []
     
     for (let i = 0; i < segments.length; i++) {
       const segment = segments[i]
+      console.log(`[${jobId}] Processing segment ${i + 1}/${segments.length}: ${segment.imageUrl?.substring(0, 70) || 'NO URL'}...`)
       
       // Process image to fit vertical format (1080x1920) - show whole car
       // Use scale and crop to maintain aspect ratio while fitting vertical format
@@ -126,7 +219,10 @@ app.post('/render', async (req: Request, res: Response) => {
       // Step 2: Apply Ken Burns zoom effect
       // zoompan syntax: z='zoom+increment':d=duration_in_frames:s=output_size
       // z='zoom+0.0005' means zoom increases by 0.0005 per frame
-      const kenBurnsFilter = `scale=${scaledWidth}:${scaledHeight}:force_original_aspect_ratio=decrease,pad=${scaledWidth}:${scaledHeight}:(ow-iw)/2:(oh-ih)/2:black,zoompan=z='min(zoom+${zoomSpeed.toFixed(6)},${endZoom})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${Math.round(duration * fps)}:s=${width}x${height}`
+      // Use high-quality scaling algorithm (lanczos for better quality)
+      // force_original_aspect_ratio=decrease ensures whole image is visible
+      // pad adds black borders if needed to maintain aspect ratio
+      const kenBurnsFilter = `scale=${scaledWidth}:${scaledHeight}:flags=lanczos:force_original_aspect_ratio=decrease,pad=${scaledWidth}:${scaledHeight}:(ow-iw)/2:(oh-ih)/2:black,zoompan=z='min(zoom+${zoomSpeed.toFixed(6)},${endZoom})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${Math.round(duration * fps)}:s=${width}x${height}:interp=lanczos`
       
       let videoFilter = kenBurnsFilter
       
@@ -164,6 +260,7 @@ app.post('/render', async (req: Request, res: Response) => {
       }
 
       // Create video clip from image
+      // Use HIGH QUALITY settings for better output
       // Use array format to avoid shell escaping issues
       const ffmpegArgs = [
         '-y',
@@ -172,32 +269,28 @@ app.post('/render', async (req: Request, res: Response) => {
         '-t', duration.toString(),
         '-vf', videoFilter,
         '-c:v', 'libx264',
-        '-preset', 'ultrafast', // Faster encoding, less memory
-        '-crf', '23', // Quality (18-28, lower = better)
+        '-preset', 'medium', // Balanced speed/quality
+        '-crf', '23', // Balanced quality (was 20, too high for Railway memory limits)
         '-pix_fmt', 'yuv420p',
         '-r', fps.toString(),
         '-threads', '2', // Limit threads to reduce memory
+        '-movflags', '+faststart', // Enable fast start for web playback
         clipPath,
       ]
-      
-      const ffmpegCmd = ['ffmpeg', ...ffmpegArgs].map(arg => {
-        // Properly escape arguments with spaces or special chars
-        if (arg.includes(' ') || arg.includes('(') || arg.includes(')')) {
-          return `"${arg.replace(/"/g, '\\"')}"`
-        }
-        return arg
-      }).join(' ')
 
       try {
-        await execAsync(ffmpegCmd, { 
-          shell: '/bin/bash',
-          maxBuffer: 10 * 1024 * 1024, // 10MB buffer
-        })
+        await execFFmpeg(ffmpegArgs, workDir, jobId, 120000) // 2 min timeout per clip
         clipPaths.push(clipPath)
+        console.log(`[${jobId}] ✓ Created clip ${i + 1}/${segments.length}: ${clipPath}`)
       } catch (error) {
         console.error(`[${jobId}] Error creating clip ${i}:`, error)
         throw new Error(`Failed to create clip ${i}: ${error instanceof Error ? error.message : 'Unknown error'}`)
       }
+    }
+    
+    console.log(`[${jobId}] Created ${clipPaths.length} clips (expected ${segments.length})`)
+    if (clipPaths.length !== segments.length) {
+      console.warn(`[${jobId}] WARNING: Clip count mismatch! Expected ${segments.length}, got ${clipPaths.length}`)
     }
 
     // Step 4: Concatenate clips with transitions
@@ -212,35 +305,26 @@ app.post('/render', async (req: Request, res: Response) => {
       const segmentDurations = segments.map(s => s.duration || 3)
       const filterComplex = buildTransitionFilter(clipPaths, transitionType, transitionDuration, fps, segmentDurations)
       
-      // Build concatenation command with proper quoting
+      // Build concatenation command using array format (no shell escaping needed)
       const concatArgs = [
         '-y',
         ...clipPaths.flatMap((clip, i) => ['-i', clip]),
-        '-filter_complex', filterComplex, // filterComplex contains brackets, needs quoting
-        '-map', '[v]', // Map the output from filter_complex
+        '-filter_complex', filterComplex,
+        '-map', '[v]',
         '-c:v', 'libx264',
-        '-preset', 'ultrafast', // Faster encoding
+        '-preset', 'medium', // Better quality encoding
+        '-crf', '23', // Balanced quality (was 20, too high for Railway memory)
         '-pix_fmt', 'yuv420p',
         '-r', fps.toString(),
-        '-threads', '2', // Limit threads
+        '-threads', '2', // Limit threads to reduce memory
+        '-movflags', '+faststart', // Enable fast start for web playback
         finalVideoPath,
       ]
-      
-      // Properly escape arguments
-      const escapedConcatArgs = concatArgs.map(arg => {
-        if (/[\s()\[\]{}:;'"`$&|<>]/.test(arg)) {
-          return `'${arg.replace(/'/g, "'\\''")}'`
-        }
-        return arg
-      })
-      
-      const concatCmd = `ffmpeg ${escapedConcatArgs.join(' ')}`
 
       try {
-        await execAsync(concatCmd, { 
-          shell: '/bin/bash',
-          maxBuffer: 10 * 1024 * 1024, // 10MB buffer
-        })
+        console.log(`[${jobId}] Starting concatenation with ${clipPaths.length} clips...`)
+        await execFFmpeg(concatArgs, workDir, jobId, 300000) // 5 min timeout for concatenation
+        console.log(`[${jobId}] ✓ Concatenation complete: ${finalVideoPath}`)
       } catch (error) {
         console.error(`[${jobId}] Error concatenating clips:`, error)
         throw new Error(`Failed to concatenate clips: ${error instanceof Error ? error.message : 'Unknown error'}`)
@@ -251,21 +335,22 @@ app.post('/render', async (req: Request, res: Response) => {
     console.log(`[${jobId}] Adding audio track...`)
     const videoWithAudioPath = path.join(workDir, 'video-with-audio.mp4')
     
-    const audioCmd = [
-      'ffmpeg',
+    const audioArgs = [
       '-y',
       '-i', finalVideoPath,
       '-i', audioPath,
-      '-c:v', 'copy',
-      '-c:a', 'aac',
+      '-c:v', 'copy', // Copy video stream (no re-encoding)
+      '-c:a', 'aac', // Encode audio to AAC
+      '-b:a', '192k', // Audio bitrate
       '-map', '0:v:0',
       '-map', '1:a:0',
-      '-shortest',
+      '-shortest', // End when shortest stream ends
       videoWithAudioPath,
-    ].join(' ')
+    ]
 
     try {
-      await execAsync(audioCmd)
+      await execFFmpeg(audioArgs, workDir, jobId, 60000) // 1 min timeout for audio merge
+      console.log(`[${jobId}] ✓ Audio added: ${videoWithAudioPath}`)
     } catch (error) {
       console.error(`[${jobId}] Error adding audio:`, error)
       throw new Error(`Failed to add audio: ${error instanceof Error ? error.message : 'Unknown error'}`)
@@ -325,7 +410,8 @@ function buildTransitionFilter(
   // Scale all inputs
   for (let i = 0; i < numClips; i++) {
     // Scale to fit vertical format while showing whole car (no cropping)
-    filters.push(`[${i}:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1[v${i}]`)
+    // Use high-quality scaling for concatenation
+    filters.push(`[${i}:v]scale=1080:1920:flags=lanczos:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1[v${i}]`)
   }
   
   // Apply transitions
