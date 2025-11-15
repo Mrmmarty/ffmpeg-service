@@ -197,8 +197,9 @@ async function processVideoAsync(
     const imagePaths: string[] = []
     const downloadPromises: Promise<void>[] = []
     
-    // Download images in parallel (batch of 5 at a time to avoid overwhelming)
-    const batchSize = 5
+    // Download images in smaller batches to reduce memory usage
+    // Railway has 1GB memory limit, so we need to be conservative
+    const batchSize = 3 // Reduced from 5 to save memory
     for (let i = 0; i < segments.length; i++) {
       const segment = segments[i]
       const imagePath = path.join(workDir, `image-${i}.jpg`)
@@ -214,9 +215,14 @@ async function processVideoAsync(
             throw new Error(`Failed to download image ${i}: ${response.status}`)
           }
           const buffer = await response.arrayBuffer()
-          await writeFile(imagePath, Buffer.from(buffer))
+          const imageBuffer = Buffer.from(buffer)
+          await writeFile(imagePath, imageBuffer)
+          // Clear buffer to help GC (though Buffer.from creates a copy, this helps)
           console.log(`[${jobId}] ✓ Downloaded image ${i + 1}/${segments.length}`)
           onProgress?.({ stage: 'downloading_images', progress: 5 + Math.round((i + 1) / segments.length * 10) })
+          
+          // Small delay to prevent overwhelming Railway resources
+          await new Promise(resolve => setTimeout(resolve, 100))
         } catch (error) {
           console.error(`[${jobId}] Error downloading image ${i}:`, error)
           throw new Error(`Failed to download image ${i}: ${error instanceof Error ? error.message : 'Unknown error'}`)
@@ -340,11 +346,12 @@ async function processVideoAsync(
         '-t', duration.toString(),
         '-vf', videoFilter,
         '-c:v', 'libx264',
-        '-preset', 'fast', // Faster encoding to avoid Railway memory limits (medium was causing OOM)
-        '-crf', '23', // Balanced quality (23 is good, 20 was too memory-intensive)
+        '-preset', 'ultrafast', // Use ultrafast to minimize memory usage
+        '-crf', '23', // Balanced quality
         '-pix_fmt', 'yuv420p',
         '-r', fps.toString(),
-        '-threads', '1', // Reduce to 1 thread to save memory (Railway was killing with 2)
+        '-threads', '1', // Single thread to save memory
+        '-tune', 'fastdecode', // Optimize for faster decoding (saves memory)
         '-movflags', '+faststart', // Enable fast start for web playback
         clipPath,
       ]
@@ -353,6 +360,11 @@ async function processVideoAsync(
         await execFFmpeg(ffmpegArgs, workDir, jobId, 120000) // 2 min timeout per clip
         clipPaths.push(clipPath)
         console.log(`[${jobId}] ✓ Created clip ${i + 1}/${segments.length}: ${clipPath}`)
+        
+        // Force garbage collection hint after each clip to free memory
+        if (global.gc && i % 3 === 0) {
+          global.gc()
+        }
       } catch (error) {
         console.error(`[${jobId}] Error creating clip ${i}:`, error)
         throw new Error(`Failed to create clip ${i}: ${error instanceof Error ? error.message : 'Unknown error'}`)

@@ -1,10 +1,14 @@
 # FFmpeg Video Rendering Service
 FROM node:18-slim
 
-# Install FFmpeg
+# Install FFmpeg and optimize for memory usage
 RUN apt-get update && apt-get install -y \
     ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Set Node.js memory limit to leave room for FFmpeg
+ENV NODE_OPTIONS="--max-old-space-size=512"
 
 # Set working directory
 WORKDIR /app
