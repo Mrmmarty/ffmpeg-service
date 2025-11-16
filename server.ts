@@ -199,11 +199,16 @@ async function processVideoAsync(
     
     onProgress?.({ stage: 'initializing', progress: 0 })
 
-    const { segments, audioUrl, carData, options, callbackUrl } = body
+    const { segments, audioUrl, carData, options, callbackUrl, dealerInfo } = body
 
     if (!segments || !Array.isArray(segments) || segments.length === 0) {
       console.error(`[${jobId}] Error: Segments array is required`)
       return
+    }
+    
+    // Log dealer info if available
+    if (dealerInfo) {
+      console.log(`[${jobId}] Dealer branding: ${dealerInfo.name || 'Unknown'} (logo: ${dealerInfo.logoUrl ? 'Yes' : 'No'})`)
     }
 
     if (!audioUrl) {
@@ -368,9 +373,24 @@ async function processVideoAsync(
       const scaledWidth = Math.round(width * scaleFactor)
       const scaledHeight = Math.round(height * scaleFactor)
       
-      // First scale and pad to show full image (no cropping), then zoom
-      // This ensures 3:2 images show more content instead of being cut off
-      const kenBurnsFilter = `scale=${scaledWidth}:${scaledHeight}:flags=lanczos:force_original_aspect_ratio=decrease,pad=${scaledWidth}:${scaledHeight}:(ow-iw)/2:(oh-ih)/2:black,zoompan=z='min(zoom+${zoomSpeed.toFixed(6)},${endZoom})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${Math.round(duration * fps)}:s=${width}x${height}`
+      // BLURRED BACKGROUND INSTEAD OF BLACK
+      // Create blurred background from the same image, then overlay the main image
+      // This creates a professional, modern look
+      const blurAmount = 20 // Blur intensity
+      
+      // For endplate, use heavily blurred background only
+      if (segment.type === 'endplate') {
+        // Endplate: Use heavily blurred background with text overlay
+        const kenBurnsFilter = `scale=${width}:${height}:flags=lanczos:force_original_aspect_ratio=increase,crop=${width}:${height},boxblur=${blurAmount * 3}:${blurAmount * 3}`
+      } else {
+        // Regular segments: Blurred background with main image on top
+        // Use filter_complex to process same input twice (blurred bg + main image)
+        // Scale main image to fit, pad with blurred background
+        const mainImageScale = `scale=${scaledWidth}:${scaledHeight}:flags=lanczos:force_original_aspect_ratio=decrease`
+        const blurredBg = `scale=${Math.round(width * 0.3)}:${Math.round(height * 0.3)}:flags=lanczos,boxblur=${blurAmount}:${blurAmount},scale=${scaledWidth}:${scaledHeight}:flags=lanczos`
+        // Pad main image on blurred background, then apply zoom
+        const kenBurnsFilter = `[0:v]${blurredBg}[bg];[0:v]${mainImageScale}[main];[bg][main]overlay=(W-w)/2:(H-h)/2,zoompan=z='min(zoom+${zoomSpeed.toFixed(6)},${endZoom})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${Math.round(duration * fps)}:s=${width}x${height}`
+      }
       
       console.log(`[${jobId}] Segment ${i + 1}: Applying Ken Burns zoom effect (${startZoom.toFixed(2)}x → ${endZoom.toFixed(2)}x over ${duration.toFixed(2)}s)`)
       
@@ -486,15 +506,61 @@ async function processVideoAsync(
         videoFilter += `,${textFilters.join(',')}`
       }
 
+      // Add dealer logo overlay if available (top-right corner, smaller size)
+      // Note: Logo overlay will be added as a separate input if logo is available
+      let logoPath: string | null = null
+      if (dealerInfo?.logoUrl && segment.type !== 'endplate') {
+        try {
+          if (dealerInfo.logoUrl.startsWith('http')) {
+            logoPath = path.join(workDir, `logo-${i}.png`)
+            const logoResponse = await fetch(dealerInfo.logoUrl)
+            if (logoResponse.ok) {
+              const logoBuffer = Buffer.from(await logoResponse.arrayBuffer())
+              await writeFile(logoPath, logoBuffer)
+              console.log(`[${jobId}] Downloaded dealer logo: ${logoPath}`)
+            }
+          } else if (dealerInfo.logoUrl.startsWith('/')) {
+            // Local file path
+            logoPath = dealerInfo.logoUrl
+          }
+        } catch (logoError) {
+          console.warn(`[${jobId}] Could not download dealer logo: ${logoError}`)
+        }
+      }
+
       // Create video clip from image
       // Use HIGH QUALITY settings for better output
       // Use array format to avoid shell escaping issues
-      const ffmpegArgs = [
+      const useFilterComplex = videoFilter.includes('[') && videoFilter.includes(']') // Check if filter_complex syntax
+      
+      // Add logo as second input if available
+      const ffmpegArgs: string[] = [
         '-y',
         '-loop', '1',
         '-i', imagePaths[i],
+      ]
+      
+      // Add logo as second input if available
+      if (logoPath && existsSync(logoPath)) {
+        ffmpegArgs.push('-loop', '1', '-i', logoPath)
+        // Add logo overlay to filter_complex
+        // Find the last output label in the filter (usually ends with [v] or similar)
+        if (useFilterComplex) {
+          // Extract the last output label (e.g., [v] from the filter)
+          const lastOutputMatch = videoFilter.match(/\[(\w+)\]$/m)
+          const lastOutput = lastOutputMatch ? lastOutputMatch[1] : 'v'
+          // Append logo overlay
+          videoFilter += `;[1:v]scale=200:200:flags=lanczos[logo];[${lastOutput}][logo]overlay=W-w-40:40`
+        } else {
+          // Convert to filter_complex to add logo
+          videoFilter = `[0:v]${videoFilter}[v];[1:v]scale=200:200:flags=lanczos[logo];[v][logo]overlay=W-w-40:40`
+        }
+        console.log(`[${jobId}] Added dealer logo overlay for segment ${i + 1}`)
+      }
+      
+      ffmpegArgs.push(
         '-t', duration.toString(),
-        '-vf', videoFilter,
+        ...(useFilterComplex || logoPath ? ['-filter_complex', videoFilter] : ['-vf', videoFilter]),
         '-c:v', 'libx264',
         '-preset', 'ultrafast', // Use ultrafast to minimize memory usage
         '-crf', '23', // Balanced quality
@@ -504,7 +570,7 @@ async function processVideoAsync(
         '-tune', 'fastdecode', // Optimize for faster decoding (saves memory)
         '-movflags', '+faststart', // Enable fast start for web playback
         clipPath,
-      ]
+      )
 
       try {
         await execFFmpeg(ffmpegArgs, workDir, jobId, 120000) // 2 min timeout per clip
