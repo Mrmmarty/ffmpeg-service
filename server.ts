@@ -544,12 +544,13 @@ async function processVideoAsync(
       const matchedVideoPath = path.join(workDir, 'video-matched.mp4')
       
       if (durationDiff > 0) {
-        // Audio is longer - extend last frame to match audio
-        console.log(`[${jobId}] Extending video to match audio duration...`)
+        // Audio is longer - extend video to match audio duration
+        // Use tpad filter to add padding frames at the end (cloning last frame)
+        console.log(`[${jobId}] Extending video to match audio duration (${durationDiff.toFixed(2)}s longer)...`)
         const extendArgs = [
           '-y',
           '-i', finalVideoPath,
-          '-vf', `tpad=stop_mode=clone:stop_duration=${durationDiff.toFixed(3)}`, // Extend by cloning last frame
+          '-vf', `tpad=stop_mode=clone:stop_duration=${durationDiff.toFixed(3)}`, // Add durationDiff seconds at end
           '-c:v', 'libx264',
           '-preset', 'ultrafast',
           '-crf', '23',
