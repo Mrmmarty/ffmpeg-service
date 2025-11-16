@@ -70,15 +70,41 @@ async function execFFmpeg(args: string[], workDir: string, jobId: string, timeou
           ? `FFmpeg process killed by signal: ${signal}` 
           : `FFmpeg exited with code ${code}`
         
-        console.error(`[${jobId}] ${errorMsg}`)
+        console.error(`[${jobId}] ❌ ${errorMsg}`)
+        console.error(`[${jobId}] FFmpeg command: ffmpeg ${args.join(' ')}`)
+        
+        // Log full stderr (FFmpeg writes errors and progress here)
         if (stderr) {
-          console.error(`[${jobId}] FFmpeg stderr: ${stderr.slice(-1000)}`) // Last 1000 chars
-        }
-        if (stdout) {
-          console.error(`[${jobId}] FFmpeg stdout: ${stdout.slice(-1000)}`)
+          const stderrLines = stderr.split('\n').filter((l: string) => l.trim())
+          console.error(`[${jobId}] FFmpeg stderr (${stderrLines.length} lines):`)
+          // Log last 50 lines of stderr (most relevant errors)
+          stderrLines.slice(-50).forEach((line: string) => {
+            if (line.trim()) {
+              console.error(`[${jobId}]   ${line}`)
+            }
+          })
         }
         
-        reject(new Error(`${errorMsg}. ${hasOutput ? 'Check logs above for details.' : 'No output received.'}`))
+        if (stdout) {
+          const stdoutLines = stdout.split('\n').filter((l: string) => l.trim())
+          console.error(`[${jobId}] FFmpeg stdout (${stdoutLines.length} lines):`)
+          stdoutLines.slice(-20).forEach((line: string) => {
+            if (line.trim()) {
+              console.error(`[${jobId}]   ${line}`)
+            }
+          })
+        }
+        
+        // Extract specific error messages from stderr
+        let specificError = ''
+        if (stderr) {
+          const errorMatch = stderr.match(/Error\s*:\s*(.+)/i) || stderr.match(/error\s*:\s*(.+)/i)
+          if (errorMatch) {
+            specificError = ` - ${errorMatch[1].trim()}`
+          }
+        }
+        
+        reject(new Error(`${errorMsg}${specificError}. ${hasOutput ? 'Check logs above for details.' : 'No output received.'}`))
       }
     })
 
@@ -260,19 +286,55 @@ async function processVideoAsync(
     onProgress?.({ stage: 'images_downloaded', progress: 15 })
 
     // Step 2: Download audio
-    console.log(`[${jobId}] Downloading audio...`)
+    console.log(`[${jobId}] Downloading audio from: ${audioUrl}`)
     onProgress?.({ stage: 'downloading_audio', progress: 20 })
     const audioPath = path.join(workDir, 'audio.mp3')
     try {
       const audioResponse = await fetch(audioUrl)
       if (!audioResponse.ok) {
-        throw new Error(`Failed to download audio: ${audioResponse.status}`)
+        throw new Error(`Failed to download audio: ${audioResponse.status} ${audioResponse.statusText}`)
       }
+      const contentType = audioResponse.headers.get('content-type') || 'unknown'
+      const contentLength = audioResponse.headers.get('content-length')
+      console.log(`[${jobId}] Audio response: contentType=${contentType}, size=${contentLength || 'unknown'} bytes`)
+      
       const audioBuffer = await audioResponse.arrayBuffer()
+      if (!audioBuffer || audioBuffer.byteLength === 0) {
+        throw new Error('Downloaded audio file is empty')
+      }
+      
       await writeFile(audioPath, Buffer.from(audioBuffer))
+      console.log(`[${jobId}] ✓ Audio downloaded: ${audioBuffer.byteLength} bytes saved to ${audioPath}`)
+      
+      // Verify audio file exists and has content
+      const fs = await import('fs/promises')
+      const stats = await fs.stat(audioPath)
+      console.log(`[${jobId}] Audio file verified: ${stats.size} bytes on disk`)
+      
+      if (stats.size === 0) {
+        throw new Error('Audio file is empty after write')
+      }
+      
+      // Get audio duration using ffprobe
+      try {
+        const audioInfo = await execAsync(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${audioPath}"`)
+        actualAudioDuration = parseFloat(audioInfo.stdout.trim()) || 0
+        console.log(`[${jobId}] Audio duration detected: ${actualAudioDuration.toFixed(2)}s`)
+        
+        if (actualAudioDuration === 0 || isNaN(actualAudioDuration)) {
+          console.warn(`[${jobId}] ⚠️ Invalid audio duration detected: ${audioInfo.stdout}, using estimated duration`)
+          actualAudioDuration = segments.reduce((sum, s) => sum + (s.duration || 3), 0)
+        }
+      } catch (probeError) {
+        console.error(`[${jobId}] ⚠️ Failed to probe audio duration:`, probeError)
+        // Don't fail here, we'll use estimated duration
+        actualAudioDuration = segments.reduce((sum, s) => sum + (s.duration || 3), 0)
+        console.log(`[${jobId}] Using estimated duration: ${actualAudioDuration.toFixed(2)}s`)
+      }
+      
       onProgress?.({ stage: 'audio_downloaded', progress: 25 })
     } catch (error) {
-      console.error(`[${jobId}] Error downloading audio:`, error)
+      console.error(`[${jobId}] ❌ Error downloading audio:`, error)
       throw new Error(`Failed to download audio: ${error instanceof Error ? error.message : 'Unknown error'}`)
     }
 
@@ -592,6 +654,28 @@ async function processVideoAsync(
     
     // Step 6: Add audio
     console.log(`[${jobId}] Adding audio track...`)
+    console.log(`[${jobId}] Video file: ${videoForAudio}`)
+    console.log(`[${jobId}] Audio file: ${audioPath}`)
+    console.log(`[${jobId}] Audio duration: ${actualAudioDuration.toFixed(3)}s`)
+    
+    // Verify files exist before attempting merge
+    try {
+      const fsPromises = await import('fs/promises')
+      const videoStats = await fsPromises.stat(videoForAudio)
+      const audioStats = await fsPromises.stat(audioPath)
+      console.log(`[${jobId}] Files verified: video=${videoStats.size} bytes, audio=${audioStats.size} bytes`)
+      
+      if (videoStats.size === 0) {
+        throw new Error('Video file is empty')
+      }
+      if (audioStats.size === 0) {
+        throw new Error('Audio file is empty')
+      }
+    } catch (statError) {
+      console.error(`[${jobId}] ❌ File verification failed:`, statError)
+      throw new Error(`File verification failed: ${statError instanceof Error ? statError.message : 'Unknown error'}`)
+    }
+    
     onProgress?.({ stage: 'adding_audio', progress: 80 })
     const videoWithAudioPath = path.join(workDir, 'video-with-audio.mp4')
     
@@ -612,8 +696,18 @@ async function processVideoAsync(
     ]
 
     try {
-      await execFFmpeg(audioArgs, workDir, jobId, 60000) // 1 min timeout for audio merge
-      console.log(`[${jobId}] ✓ Audio added: ${videoWithAudioPath}`)
+      console.log(`[${jobId}] Executing FFmpeg audio merge command...`)
+      await execFFmpeg(audioArgs, workDir, jobId, 120000) // 2 min timeout for audio merge
+      
+      // Verify output file was created
+      const fsPromises = await import('fs/promises')
+      const outputStats = await fsPromises.stat(videoWithAudioPath)
+      console.log(`[${jobId}] ✓ Audio merge complete: ${videoWithAudioPath} (${outputStats.size} bytes)`)
+      
+      if (outputStats.size === 0) {
+        throw new Error('Output video file is empty after audio merge')
+      }
+      
       onProgress?.({ stage: 'audio_added', progress: 85 })
       
       // VALIDATION: Verify final video has audio and correct duration - CRITICAL CHECK
