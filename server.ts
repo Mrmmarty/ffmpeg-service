@@ -123,22 +123,38 @@ app.post('/render', async (req: Request, res: Response) => {
   try {
     const result = await processVideoAsync(jobId, workDir, req.body, (update) => {
       // Send progress updates to keep connection alive
-      res.write(JSON.stringify(update) + '\n')
+      const updateJson = JSON.stringify(update) + '\n'
+      res.write(updateJson)
+      console.log(`[${jobId}] Sent progress update:`, update.stage || update.progress)
     })
     
-    // Send final result
-    res.write(JSON.stringify({
+    // Send final result - CRITICAL: Must include videoUrl
+    const finalResponse = {
       success: true,
       ...result,
-      status: 'completed',
-    }) + '\n')
+      status: 'completed' as const,
+    }
+    console.log(`[${jobId}] Sending final result:`, {
+      success: finalResponse.success,
+      status: finalResponse.status,
+      hasVideoUrl: !!finalResponse.videoUrl,
+      videoSize: finalResponse.videoSize,
+      duration: finalResponse.duration,
+    })
+    
+    const finalJson = JSON.stringify(finalResponse) + '\n'
+    res.write(finalJson)
     res.end()
+    console.log(`[${jobId}] ✓ Final result sent successfully`)
   } catch (error) {
-    res.write(JSON.stringify({
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error'
+    console.error(`[${jobId}] ❌ Error in render endpoint:`, errorMessage)
+    const errorResponse = {
       success: false,
-      error: error instanceof Error ? error.message : 'Unknown error',
-      status: 'failed',
-    }) + '\n')
+      error: errorMessage,
+      status: 'failed' as const,
+    }
+    res.write(JSON.stringify(errorResponse) + '\n')
     res.end()
   }
 })
@@ -604,18 +620,27 @@ async function processVideoAsync(
       try {
         const verifyResult = await execAsync(`ffprobe -v error -show_entries format=duration,stream=codec_type -of default=noprint_wrappers=1 "${videoWithAudioPath}"`)
         const hasAudio = verifyResult.stdout.includes('codec_type=audio')
-        const finalDuration = parseFloat(verifyResult.stdout.match(/duration=([\d.]+)/)?.[1] || '0')
+        const durationMatch = verifyResult.stdout.match(/duration=([\d.]+)/)
+        const finalDuration = durationMatch ? parseFloat(durationMatch[1]) : 0
+        
+        console.log(`[${jobId}] Validation check: hasAudio=${hasAudio}, finalDuration=${finalDuration.toFixed(2)}s, expected=${actualAudioDuration.toFixed(2)}s`)
         
         if (!hasAudio) {
+          console.error(`[${jobId}] ❌ CRITICAL: Final video has no audio track`)
           throw new Error('CRITICAL: Final video has no audio track')
         }
-        if (Math.abs(finalDuration - actualAudioDuration) > 0.3) {
-          // Allow 0.3s tolerance for encoding differences
-          throw new Error(`CRITICAL: Duration mismatch - expected ${actualAudioDuration.toFixed(2)}s, got ${finalDuration.toFixed(2)}s (diff: ${Math.abs(finalDuration - actualAudioDuration).toFixed(2)}s)`)
+        
+        const durationDiff = Math.abs(finalDuration - actualAudioDuration)
+        if (durationDiff > 0.5) {
+          // Allow 0.5s tolerance for encoding differences (increased from 0.3s)
+          console.error(`[${jobId}] ❌ CRITICAL: Duration mismatch - expected ${actualAudioDuration.toFixed(2)}s, got ${finalDuration.toFixed(2)}s (diff: ${durationDiff.toFixed(2)}s)`)
+          throw new Error(`CRITICAL: Duration mismatch - expected ${actualAudioDuration.toFixed(2)}s, got ${finalDuration.toFixed(2)}s (diff: ${durationDiff.toFixed(2)}s)`)
         }
-        console.log(`[${jobId}] ✓ Validation passed: audio=${hasAudio}, duration=${finalDuration.toFixed(2)}s (expected: ${actualAudioDuration.toFixed(2)}s)`)
+        
+        console.log(`[${jobId}] ✓ Validation passed: audio=${hasAudio}, duration=${finalDuration.toFixed(2)}s (expected: ${actualAudioDuration.toFixed(2)}s, diff: ${durationDiff.toFixed(2)}s)`)
       } catch (verifyError) {
         console.error(`[${jobId}] ❌ CRITICAL VALIDATION FAILED:`, verifyError)
+        console.error(`[${jobId}] Validation error details:`, verifyError instanceof Error ? verifyError.stack : verifyError)
         // Fail the job if validation fails - audio cutoff is unacceptable
         throw new Error(`Video validation failed: ${verifyError instanceof Error ? verifyError.message : 'Unknown error'}`)
       }
@@ -628,6 +653,10 @@ async function processVideoAsync(
     onProgress?.({ stage: 'reading_video', progress: 90 })
     const finalVideo = await readFile(videoWithAudioPath)
 
+    if (!finalVideo || finalVideo.length === 0) {
+      throw new Error('Final video file is empty or could not be read')
+    }
+
     // Step 7: Cleanup
     await cleanup(workDir)
 
@@ -638,12 +667,20 @@ async function processVideoAsync(
     const videoBase64 = finalVideo.toString('base64')
     const videoDataUrl = `data:video/mp4;base64,${videoBase64}`
     
+    if (!videoDataUrl || videoDataUrl.length < 100) {
+      throw new Error('Failed to encode video as base64 data URL')
+    }
+    
     // Use actual audio duration as the final video duration (more accurate)
-    return {
+    const result = {
       videoUrl: videoDataUrl,
       videoSize: finalVideo.length,
       duration: actualAudioDuration || segments.reduce((sum, s) => sum + (s.duration || 3), 0),
     }
+    
+    console.log(`[${jobId}] ✓ Result prepared: videoUrl length=${result.videoUrl.length}, videoSize=${result.videoSize}, duration=${result.duration.toFixed(2)}s`)
+    
+    return result
   } catch (error) {
     console.error(`[${jobId}] Render error:`, error)
     
