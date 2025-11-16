@@ -712,10 +712,12 @@ async function processVideoAsync(
       
       // VALIDATION: Verify final video has audio and correct duration - CRITICAL CHECK
       try {
-        const verifyResult = await execAsync(`ffprobe -v error -show_entries format=duration,stream=codec_type -of default=noprint_wrappers=1 "${videoWithAudioPath}"`)
-        const hasAudio = verifyResult.stdout.includes('codec_type=audio')
-        const durationMatch = verifyResult.stdout.match(/duration=([\d.]+)/)
-        const finalDuration = durationMatch ? parseFloat(durationMatch[1]) : 0
+        // Detect any audio stream
+        const audioProbe = await execAsync(`ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "${videoWithAudioPath}"`)
+        const hasAudio = audioProbe.stdout.trim().length > 0
+        // Get final duration precisely
+        const durationProbe = await execAsync(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${videoWithAudioPath}"`)
+        const finalDuration = parseFloat(durationProbe.stdout.trim() || '0')
         
         console.log(`[${jobId}] Validation check: hasAudio=${hasAudio}, finalDuration=${finalDuration.toFixed(2)}s, expected=${actualAudioDuration.toFixed(2)}s`)
         
