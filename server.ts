@@ -378,10 +378,13 @@ async function processVideoAsync(
       // This creates a professional, modern look
       const blurAmount = 20 // Blur intensity
       
+      // Declare kenBurnsFilter outside if/else block to fix scope issue
+      let kenBurnsFilter: string
+      
       // For endplate, use heavily blurred background only
       if (segment.type === 'endplate') {
         // Endplate: Use heavily blurred background with text overlay
-        const kenBurnsFilter = `scale=${width}:${height}:flags=lanczos:force_original_aspect_ratio=increase,crop=${width}:${height},boxblur=${blurAmount * 3}:${blurAmount * 3}`
+        kenBurnsFilter = `scale=${width}:${height}:flags=lanczos:force_original_aspect_ratio=increase,crop=${width}:${height},boxblur=${blurAmount * 3}:${blurAmount * 3}`
       } else {
         // Regular segments: Blurred background with main image on top
         // Use filter_complex to process same input twice (blurred bg + main image)
@@ -389,7 +392,7 @@ async function processVideoAsync(
         const mainImageScale = `scale=${scaledWidth}:${scaledHeight}:flags=lanczos:force_original_aspect_ratio=decrease`
         const blurredBg = `scale=${Math.round(width * 0.3)}:${Math.round(height * 0.3)}:flags=lanczos,boxblur=${blurAmount}:${blurAmount},scale=${scaledWidth}:${scaledHeight}:flags=lanczos`
         // Pad main image on blurred background, then apply zoom
-        const kenBurnsFilter = `[0:v]${blurredBg}[bg];[0:v]${mainImageScale}[main];[bg][main]overlay=(W-w)/2:(H-h)/2,zoompan=z='min(zoom+${zoomSpeed.toFixed(6)},${endZoom})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${Math.round(duration * fps)}:s=${width}x${height}`
+        kenBurnsFilter = `[0:v]${blurredBg}[bg];[0:v]${mainImageScale}[main];[bg][main]overlay=(W-w)/2:(H-h)/2,zoompan=z='min(zoom+${zoomSpeed.toFixed(6)},${endZoom})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${Math.round(duration * fps)}:s=${width}x${height}`
       }
       
       console.log(`[${jobId}] Segment ${i + 1}: Applying Ken Burns zoom effect (${startZoom.toFixed(2)}x → ${endZoom.toFixed(2)}x over ${duration.toFixed(2)}s)`)
