@@ -395,35 +395,12 @@ async function processVideoAsync(
         
         // Wrap text to fit character limit per line
         const wrappedText = wrapTextSimple(segment.textOverlay, maxCharsPerLine)
-        const lines = wrappedText.split('\n')
-        const maxLineLength = Math.max(...lines.map(l => l.length))
+        const lines = wrappedText.split('\n').filter(line => line.trim().length > 0) // Remove empty lines
+        const maxLineLength = Math.max(...lines.map(l => l.length), 1)
         
         // Calculate line spacing and position
-        const lineSpacing = Math.max(8, Math.floor(fontSize * 0.2)) // 20% of font size
+        const lineSpacing = Math.max(8, Math.floor(fontSize * 0.25)) // 25% of font size for better readability
         const totalTextHeight = (fontSize + lineSpacing) * lines.length - lineSpacing
-        let yPosition: string
-        
-        if (segment.type === 'opener') {
-          yPosition = '60' // Top area
-        } else if (segment.type === 'cta') {
-          yPosition = 'h-th-150' // Bottom area
-        } else {
-          yPosition = '100' // Middle-top area
-        }
-        
-        // Escape text for FFmpeg drawtext filter
-        const escapedText = wrappedText
-          .replace(/\\/g, '\\\\')
-          .replace(/:/g, '\\:')
-          .replace(/'/g, "\\'")
-          .replace(/"/g, '\\"')
-          .replace(/\(/g, '\\(')
-          .replace(/\)/g, '\\)')
-          .replace(/\[/g, '\\[')
-          .replace(/\]/g, '\\]')
-          .replace(/\{/g, '\\{')
-          .replace(/\}/g, '\\}')
-          .replace(/\n/g, '\\n') // Escape newlines for FFmpeg
         
         // Use textTiming if provided, otherwise show for entire duration
         const textStart = segment.textTiming?.start ?? 0
@@ -463,14 +440,50 @@ async function processVideoAsync(
           console.log(`[${jobId}] Font check failed, using default`)
         }
         
-        // Use drawtext with modern font and manual wrapping (newlines) to ensure text fits frame
-        // fix_bounds=1 ensures text doesn't go outside frame boundaries
-        // x=(w-text_w)/2 centers horizontally using actual text width
-        // box=1 creates background box that scales with text
-        // line_spacing controls spacing between wrapped lines
-        // fontfile uses modern DejaVu Sans Bold for clean, professional look
-        const textFilter = `drawtext=${fontfileParam}text='${escapedText}':fontsize=${fontSize}:fontcolor=white:x=(w-text_w)/2:y=${yPosition}:box=1:boxcolor=black@0.85:boxborderw=14:fix_bounds=1:line_spacing=${lineSpacing}:enable='between(t,${textStart},${textEnd})'`
-        videoFilter += `,${textFilter}`
+        // CRITICAL FIX: FFmpeg drawtext does NOT support newlines (\n)
+        // We must create separate drawtext filters for each line
+        // Calculate base Y position based on segment type
+        let baseYPosition: number
+        if (segment.type === 'opener') {
+          baseYPosition = 60 // Top area
+        } else if (segment.type === 'cta') {
+          // For CTA, position from bottom: h - totalTextHeight - margin
+          baseYPosition = 1920 - totalTextHeight - 150 // Bottom area with margin
+        } else {
+          baseYPosition = 100 // Middle-top area
+        }
+        
+        // Create one drawtext filter per line
+        const textFilters: string[] = []
+        for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+          const line = lines[lineIndex]
+          
+          // Escape text for FFmpeg drawtext filter (NO newline escaping - we handle lines separately)
+          const escapedLine = line
+            .replace(/\\/g, '\\\\')
+            .replace(/:/g, '\\:')
+            .replace(/'/g, "\\'")
+            .replace(/"/g, '\\"')
+            .replace(/\(/g, '\\(')
+            .replace(/\)/g, '\\)')
+            .replace(/\[/g, '\\[')
+            .replace(/\]/g, '\\]')
+            .replace(/\{/g, '\\{')
+            .replace(/\}/g, '\\}')
+          
+          // Calculate Y position for this line (stack lines vertically)
+          const lineY = baseYPosition + (lineIndex * (fontSize + lineSpacing))
+          
+          // Create drawtext filter for this line
+          // x=(w-text_w)/2 centers horizontally using actual text width
+          // box=1 creates background box that scales with text
+          // fix_bounds=1 ensures text doesn't go outside frame boundaries
+          const lineFilter = `drawtext=${fontfileParam}text='${escapedLine}':fontsize=${fontSize}:fontcolor=white:x=(w-text_w)/2:y=${lineY}:box=1:boxcolor=black@0.85:boxborderw=14:fix_bounds=1:enable='between(t,${textStart},${textEnd})'`
+          textFilters.push(lineFilter)
+        }
+        
+        // Add all text filters to video filter
+        videoFilter += `,${textFilters.join(',')}`
       }
 
       // Create video clip from image
