@@ -606,7 +606,7 @@ async function processVideoAsync(
     if (segments.length === 1) {
       // Single clip, no transition needed
       await execAsync(`cp "${clipPaths[0]}" "${finalVideoPath}"`)
-    } else if (transitionType === 'none' || clipPaths.length > 10) {
+    } else if (transitionType === 'none') {
       // Use concat demuxer for faster concatenation (no transitions)
       // This is much faster than filter_complex and avoids Railway timeouts
       const concatListPath = path.join(workDir, 'concat-list.txt')
@@ -675,8 +675,21 @@ async function processVideoAsync(
     console.log(`[${jobId}] Matching video duration to audio...`)
     onProgress?.({ stage: 'matching_duration', progress: 75 })
     
-    // Calculate actual video duration from segments
+    // Calculate actual video duration from segments and verify via ffprobe
     const calculatedVideoDuration = segments.reduce((sum, s) => sum + (s.duration || 0), 0)
+    let videoDurationForMatching = calculatedVideoDuration
+    try {
+      const videoProbe = await execAsync(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${finalVideoPath}"`)
+      const probedVideoDuration = parseFloat(videoProbe.stdout.trim())
+      if (!isNaN(probedVideoDuration) && probedVideoDuration > 0) {
+        videoDurationForMatching = probedVideoDuration
+        console.log(`[${jobId}] ✓ Measured video duration via ffprobe: ${videoDurationForMatching.toFixed(2)}s (segments total: ${calculatedVideoDuration.toFixed(2)}s)`)
+      } else {
+        console.warn(`[${jobId}] ⚠️ Invalid video duration from ffprobe (${videoProbe.stdout.trim()}), using calculated duration`)
+      }
+    } catch (probeError) {
+      console.warn(`[${jobId}] ⚠️ Failed to probe video duration via ffprobe, using calculated duration. Error:`, probeError)
+    }
     
     // Get actual audio duration using ffprobe - CRITICAL: Must succeed to prevent audio cutoff
     try {
@@ -696,10 +709,10 @@ async function processVideoAsync(
     
     // Ensure video duration matches audio duration exactly
     let videoForAudio = finalVideoPath
-    const durationDiff = actualAudioDuration - calculatedVideoDuration
+    let durationDiff = actualAudioDuration - videoDurationForMatching
     
     if (Math.abs(durationDiff) > 0.1) { // More than 0.1s difference
-      console.log(`[${jobId}] Duration mismatch: audio=${actualAudioDuration.toFixed(2)}s, video=${calculatedVideoDuration.toFixed(2)}s, diff=${durationDiff.toFixed(2)}s`)
+      console.log(`[${jobId}] Duration mismatch: audio=${actualAudioDuration.toFixed(2)}s, video=${videoDurationForMatching.toFixed(2)}s, diff=${durationDiff.toFixed(2)}s`)
       
       const matchedVideoPath = path.join(workDir, 'video-matched.mp4')
       
@@ -719,6 +732,7 @@ async function processVideoAsync(
         ]
         await execFFmpeg(extendArgs, workDir, jobId, 30000)
         videoForAudio = matchedVideoPath
+        videoDurationForMatching = actualAudioDuration
       } else {
         // Audio is shorter - trim video to match audio
         console.log(`[${jobId}] Trimming video to match audio duration...`)
@@ -731,6 +745,7 @@ async function processVideoAsync(
         ]
         await execFFmpeg(trimArgs, workDir, jobId, 30000)
         videoForAudio = matchedVideoPath
+        videoDurationForMatching = actualAudioDuration
       }
     }
     
