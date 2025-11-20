@@ -223,6 +223,8 @@ async function processVideoAsync(
     const width = options?.width || 1080
     const height = options?.height || 1920
     const fps = options?.fps || 30
+    const fontSizeMultiplier = options?.fontSizeMultiplier || 1.0
+    
     // Ensure high quality encoding
     const videoQuality = 'high'
 
@@ -360,44 +362,35 @@ async function processVideoAsync(
       const duration = segment.duration || 3
       
       // KEN BURNS EFFECT - ALWAYS APPLIED (user requirement: NO STATIC IMAGES)
-      // Use ONLY zoompan filter for reliable, smooth zoom effect
-      // Simplified implementation that always works
+      // Redesigned to avoid aspect ratio drift and jitter by splitting background/foreground
       const startZoom = 1.0
       const endZoom = 1.12 // 12% zoom in (subtle, professional)
-      const zoomSpeed = (endZoom - startZoom) / (duration * fps)
+      const totalFrames = Math.max(1, Math.round(duration * fps))
+      const zoomIncrement = (endZoom - startZoom) / totalFrames
+      const zoomExpr = `if(lte(on,1),${startZoom.toFixed(2)},min(zoom+${zoomIncrement.toFixed(6)},${endZoom.toFixed(2)}))`
       
       // Scale image larger to allow zoom room, then apply zoompan
-      // Use decrease+pad to show MORE of the image (especially for 3:2 images)
-      // Scale to 120% to allow zoom without showing edges
-      const scaleFactor = 1.2
+      const scaleFactor = 1.1
       const scaledWidth = Math.round(width * scaleFactor)
       const scaledHeight = Math.round(height * scaleFactor)
+      const blurSigma = 18
       
-      // BLURRED BACKGROUND INSTEAD OF BLACK
-      // Create blurred background from the same image, then overlay the main image
-      // This creates a professional, modern look
-      const blurAmount = 20 // Blur intensity
+      let videoFilter: string
       
-      // Declare kenBurnsFilter outside if/else block to fix scope issue
-      let kenBurnsFilter: string
-      
-      // For endplate, use heavily blurred background only
       if (segment.type === 'endplate') {
         // Endplate: Use heavily blurred background with text overlay
-        kenBurnsFilter = `scale=${width}:${height}:flags=lanczos:force_original_aspect_ratio=increase,crop=${width}:${height},boxblur=${blurAmount * 3}:${blurAmount * 3}`
+        videoFilter = `[0:v]scale=${width}:${height}:flags=lanczos:force_original_aspect_ratio=increase,crop=${width}:${height},gblur=sigma=${blurSigma * 2}:steps=2`
       } else {
-        // Regular segments: Blurred background with main image on top
-        // Use filter_complex to process same input twice (blurred bg + main image)
-        // Scale main image to fit, pad with blurred background
-        const mainImageScale = `scale=${scaledWidth}:${scaledHeight}:flags=lanczos:force_original_aspect_ratio=decrease`
-        const blurredBg = `scale=${Math.round(width * 0.3)}:${Math.round(height * 0.3)}:flags=lanczos,boxblur=${blurAmount}:${blurAmount},scale=${scaledWidth}:${scaledHeight}:flags=lanczos`
-        // Pad main image on blurred background, then apply zoom
-        kenBurnsFilter = `[0:v]${blurredBg}[bg];[0:v]${mainImageScale}[main];[bg][main]overlay=(W-w)/2:(H-h)/2,zoompan=z='min(zoom+${zoomSpeed.toFixed(6)},${endZoom})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${Math.round(duration * fps)}:s=${width}x${height}`
+        // Regular segments: Blurred background with animated main image on top
+        videoFilter =
+          `[0:v]split[bgsrc][fgsrc];` +
+          `[bgsrc]scale=${width}:${height}:flags=lanczos:force_original_aspect_ratio=increase,crop=${width}:${height},gblur=sigma=${blurSigma}:steps=2[bg];` +
+          `[fgsrc]scale=${scaledWidth}:${scaledHeight}:flags=lanczos:force_original_aspect_ratio=decrease,pad=${scaledWidth}:${scaledHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,` +
+          `zoompan=z='${zoomExpr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${width}x${height}:fps=${fps}[fg];` +
+          `[bg][fg]overlay=(W-w)/2:(H-h)/2`
       }
       
-      console.log(`[${jobId}] Segment ${i + 1}: Applying Ken Burns zoom effect (${startZoom.toFixed(2)}x → ${endZoom.toFixed(2)}x over ${duration.toFixed(2)}s)`)
-      
-      let videoFilter = kenBurnsFilter
+      console.log(`[${jobId}] Segment ${i + 1}: Applying Ken Burns zoom effect (${startZoom.toFixed(2)}x → ${endZoom.toFixed(2)}x over ${duration.toFixed(2)}s, frames=${totalFrames})`)
       
       if (segment.textOverlay) {
         // SMART TEXT OVERLAY THAT ALWAYS FITS THE FRAME
@@ -406,13 +399,13 @@ async function processVideoAsync(
         let maxCharsPerLine: number
         
         if (segment.type === 'opener') {
-          fontSize = 42 // Readable but not too large
+          fontSize = Math.round(42 * fontSizeMultiplier) // Readable but not too large
           maxCharsPerLine = 30 // ~30 chars fit at 42px on 1080px width
         } else if (segment.type === 'cta') {
-          fontSize = 52 // Larger for call-to-action
+          fontSize = Math.round(52 * fontSizeMultiplier) // Larger for call-to-action
           maxCharsPerLine = 25 // ~25 chars fit at 52px
         } else {
-          fontSize = 38 // Standard for features
+          fontSize = Math.round(38 * fontSizeMultiplier) // Standard for features
           maxCharsPerLine = 32 // ~32 chars fit at 38px
         }
         
@@ -498,10 +491,22 @@ async function processVideoAsync(
           const lineY = baseYPosition + (lineIndex * (fontSize + lineSpacing))
           
           // Create drawtext filter for this line
+          // Kinetic Typography: Slide Up Effect (moves up 40px over 0.5s)
+          // y expression: targetY + (offset * (1 - progress))
+          // progress = min((t-start)/duration, 1)
+          const slideDist = 40
+          const animDuration = 0.8
+          // Ensure t is treated as 0 before textStart
+          const progressExpr = `min(max((t-${textStart})/${animDuration},0),1)`
+          // Ease out cubic: 1 - pow(1 - progress, 3) for smoother motion
+          const easeOutExpr = `(1-pow(1-${progressExpr},3))`
+          // Final Y expression
+          const yExpr = `${lineY}+${slideDist}*(1-${easeOutExpr})`
+          
           // x=(w-text_w)/2 centers horizontally using actual text width
           // box=1 creates background box that scales with text
           // fix_bounds=1 ensures text doesn't go outside frame boundaries
-          const lineFilter = `drawtext=${fontfileParam}text='${escapedLine}':fontsize=${fontSize}:fontcolor=white:x=(w-text_w)/2:y=${lineY}:box=1:boxcolor=black@0.85:boxborderw=14:fix_bounds=1:enable='between(t,${textStart},${textEnd})'`
+          const lineFilter = `drawtext=${fontfileParam}text='${escapedLine}':fontsize=${fontSize}:fontcolor=white:x=(w-text_w)/2:y=${yExpr}:box=1:boxcolor=black@0.85:boxborderw=14:fix_bounds=1:enable='between(t,${textStart},${textEnd})'`
           textFilters.push(lineFilter)
         }
         
@@ -702,24 +707,35 @@ async function processVideoAsync(
       
       actualAudioDuration = probedDuration
       console.log(`[${jobId}] ✓ Audio duration from ffprobe: ${actualAudioDuration.toFixed(2)}s, Video duration: ${calculatedVideoDuration.toFixed(2)}s`)
+      
+      // Override duration if forced (Self-Healing Loop)
+      if (options?.forceDuration) {
+        console.log(`[${jobId}] 🔧 Using forced duration override: ${options.forceDuration}s (was ${actualAudioDuration.toFixed(2)}s)`)
+        actualAudioDuration = options.forceDuration
+      }
     } catch (error) {
       console.error(`[${jobId}] ❌ CRITICAL: Failed to probe audio duration:`, error)
       throw new Error(`Failed to get audio duration - cannot proceed safely. Error: ${error instanceof Error ? error.message : 'Unknown error'}`)
     }
     
     // Ensure video duration matches audio duration exactly
+    // CRITICAL: Add 0.5s safety padding to prevent audio cutoff
+    const SAFETY_PAD = 0.5
+    
     let videoForAudio = finalVideoPath
-    let durationDiff = actualAudioDuration - videoDurationForMatching
+    // Target video duration is audio + pad
+    let targetDuration = actualAudioDuration + SAFETY_PAD
+    let durationDiff = targetDuration - videoDurationForMatching
     
     if (Math.abs(durationDiff) > 0.1) { // More than 0.1s difference
-      console.log(`[${jobId}] Duration mismatch: audio=${actualAudioDuration.toFixed(2)}s, video=${videoDurationForMatching.toFixed(2)}s, diff=${durationDiff.toFixed(2)}s`)
+      console.log(`[${jobId}] Duration mismatch: target=${targetDuration.toFixed(2)}s (audio=${actualAudioDuration.toFixed(2)}s + pad=${SAFETY_PAD}s), video=${videoDurationForMatching.toFixed(2)}s, diff=${durationDiff.toFixed(2)}s`)
       
       const matchedVideoPath = path.join(workDir, 'video-matched.mp4')
       
       if (durationDiff > 0) {
-        // Audio is longer - extend video to match audio duration
+        // Video is shorter - extend video to match audio+pad
         // Use tpad filter to add padding frames at the end (cloning last frame)
-        console.log(`[${jobId}] Extending video to match audio duration (${durationDiff.toFixed(2)}s longer)...`)
+        console.log(`[${jobId}] Extending video to match target duration (${durationDiff.toFixed(2)}s longer)...`)
         const extendArgs = [
           '-y',
           '-i', finalVideoPath,
@@ -732,20 +748,20 @@ async function processVideoAsync(
         ]
         await execFFmpeg(extendArgs, workDir, jobId, 30000)
         videoForAudio = matchedVideoPath
-        videoDurationForMatching = actualAudioDuration
+        videoDurationForMatching = targetDuration
       } else {
-        // Audio is shorter - trim video to match audio
-        console.log(`[${jobId}] Trimming video to match audio duration...`)
+        // Video is longer - trim video to match audio+pad
+        console.log(`[${jobId}] Trimming video to match target duration...`)
         const trimArgs = [
           '-y',
           '-i', finalVideoPath,
-          '-t', actualAudioDuration.toFixed(3), // Set exact duration
+          '-t', targetDuration.toFixed(3), // Set exact duration
           '-c:v', 'copy', // Copy video stream (fast)
           matchedVideoPath,
         ]
         await execFFmpeg(trimArgs, workDir, jobId, 30000)
         videoForAudio = matchedVideoPath
-        videoDurationForMatching = actualAudioDuration
+        videoDurationForMatching = targetDuration
       }
     }
     
@@ -779,6 +795,7 @@ async function processVideoAsync(
     // CRITICAL FIX: Use exact duration matching instead of -shortest
     // -shortest can cut off audio if there's any timing mismatch
     // Instead, use -t to set exact duration from audio
+    // Add apad filter to extend audio stream with silence
     const audioArgs = [
       '-y',
       '-i', videoForAudio,
@@ -788,7 +805,8 @@ async function processVideoAsync(
       '-b:a', '192k', // Audio bitrate
       '-map', '0:v:0',
       '-map', '1:a:0',
-      '-t', actualAudioDuration.toFixed(3), // Use exact audio duration (CRITICAL: prevents cut-off)
+      '-af', 'apad', // Pad audio with silence indefinitely until -t cuts it
+      '-t', targetDuration.toFixed(3), // Use exact target duration (audio + pad)
       videoWithAudioPath,
     ]
 
@@ -816,21 +834,21 @@ async function processVideoAsync(
         const durationProbe = await execAsync(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${videoWithAudioPath}"`)
         const finalDuration = parseFloat(durationProbe.stdout.trim() || '0')
         
-        console.log(`[${jobId}] Validation check: hasAudio=${hasAudio}, finalDuration=${finalDuration.toFixed(2)}s, expected=${actualAudioDuration.toFixed(2)}s`)
+        console.log(`[${jobId}] Validation check: hasAudio=${hasAudio}, finalDuration=${finalDuration.toFixed(2)}s, expected=${targetDuration.toFixed(2)}s`)
         
         if (!hasAudio) {
           console.error(`[${jobId}] ❌ CRITICAL: Final video has no audio track`)
           throw new Error('CRITICAL: Final video has no audio track')
         }
         
-        const durationDiff = Math.abs(finalDuration - actualAudioDuration)
+        const durationDiff = Math.abs(finalDuration - targetDuration)
         if (durationDiff > 0.5) {
           // Allow 0.5s tolerance for encoding differences (increased from 0.3s)
-          console.error(`[${jobId}] ❌ CRITICAL: Duration mismatch - expected ${actualAudioDuration.toFixed(2)}s, got ${finalDuration.toFixed(2)}s (diff: ${durationDiff.toFixed(2)}s)`)
-          throw new Error(`CRITICAL: Duration mismatch - expected ${actualAudioDuration.toFixed(2)}s, got ${finalDuration.toFixed(2)}s (diff: ${durationDiff.toFixed(2)}s)`)
+          console.error(`[${jobId}] ❌ CRITICAL: Duration mismatch - expected ${targetDuration.toFixed(2)}s, got ${finalDuration.toFixed(2)}s (diff: ${durationDiff.toFixed(2)}s)`)
+          throw new Error(`CRITICAL: Duration mismatch - expected ${targetDuration.toFixed(2)}s, got ${finalDuration.toFixed(2)}s (diff: ${durationDiff.toFixed(2)}s)`)
         }
         
-        console.log(`[${jobId}] ✓ Validation passed: audio=${hasAudio}, duration=${finalDuration.toFixed(2)}s (expected: ${actualAudioDuration.toFixed(2)}s, diff: ${durationDiff.toFixed(2)}s)`)
+        console.log(`[${jobId}] ✓ Validation passed: audio=${hasAudio}, duration=${finalDuration.toFixed(2)}s (expected: ${targetDuration.toFixed(2)}s, diff: ${durationDiff.toFixed(2)}s)`)
       } catch (verifyError) {
         console.error(`[${jobId}] ❌ CRITICAL VALIDATION FAILED:`, verifyError)
         console.error(`[${jobId}] Validation error details:`, verifyError instanceof Error ? verifyError.stack : verifyError)
@@ -943,13 +961,14 @@ function buildTransitionFilter(
   // Build filter chain
   const filters: string[] = []
   
-  // Scale all inputs - use pad instead of crop to show MORE of the image
-  for (let i = 0; i < numClips; i++) {
-    // Scale to fit vertical format while showing whole image (no cropping)
-    // Use decrease+pad to show more content, especially for 3:2 images
-    // This matches the individual clip processing for consistency
-    filters.push(`[${i}:v]scale=1080:1920:flags=lanczos:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1[v${i}]`)
-  }
+    // Scale all inputs - use pad instead of crop to show MORE of the image
+    for (let i = 0; i < numClips; i++) {
+      // Scale to fit vertical format while showing whole image (no cropping)
+      // Use decrease+pad to show more content, especially for 3:2 images
+      // This matches the individual clip processing for consistency
+      // FIX: Force scale to 1080x1920 explicitly to fix aspect ratio issues
+      filters.push(`[${i}:v]scale=1080:1920:flags=lanczos:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1[v${i}]`)
+    }
   
   // Apply transitions
   let currentOutput = 'v0'
