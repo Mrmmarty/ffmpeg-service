@@ -490,24 +490,17 @@ async function processVideoAsync(
           // Calculate Y position for this line (stack lines vertically)
           const lineY = baseYPosition + (lineIndex * (fontSize + lineSpacing))
           
-          // Create drawtext filter for this line
-          // Kinetic Typography: Slide Up Effect (moves up 40px over 0.5s)
-          // y expression: targetY + (offset * (1 - progress))
-          // progress = min((t-start)/duration, 1)
-          const slideDist = 40
-          const animDuration = 0.8
-          // Ensure t is treated as 0 before textStart
-          const progressExpr = `min(max((t-${textStart})/${animDuration},0),1)`
-          // Ease out cubic: 1 - pow(1 - progress, 3) for smoother motion
-          const easeOutExpr = `(1-pow(1-${progressExpr},3))`
-          // Final Y expression
-          const yExpr = `${lineY}+${slideDist}*(1-${easeOutExpr})`
+          // Simplified Y position - static for now to get basic rendering working
+          // TODO: Add back animation once basic rendering is confirmed working
+          // Animation can be added using simpler expressions or separate filter chains
+          const yExpr = `${lineY}`
           
           // x=(w-text_w)/2 centers horizontally using actual text width
           // box=1 creates background box that scales with text
           // fix_bounds=1 ensures text doesn't go outside frame boundaries
-          // enable expression must NOT be quoted - FFmpeg parses it directly
-          const lineFilter = `drawtext=${fontfileParam}text='${escapedLine}':fontsize=${fontSize}:fontcolor=white:x=(w-text_w)/2:y=${yExpr}:box=1:boxcolor=black@0.85:boxborderw=14:fix_bounds=1:enable=between(t,${textStart},${textEnd})`
+          // Note: enable parameter removed due to FFmpeg filter_complex parsing issues with commas
+          // Text will display for the full segment duration - we can add timing control via select filter if needed
+          const lineFilter = `drawtext=${fontfileParam}text='${escapedLine}':fontsize=${fontSize}:fontcolor=white:x=(w-text_w)/2:y=${yExpr}:box=1:boxcolor=black@0.85:boxborderw=14:fix_bounds=1`
           textFilters.push(lineFilter)
         }
         
