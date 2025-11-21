@@ -506,7 +506,8 @@ async function processVideoAsync(
           // x=(w-text_w)/2 centers horizontally using actual text width
           // box=1 creates background box that scales with text
           // fix_bounds=1 ensures text doesn't go outside frame boundaries
-          const lineFilter = `drawtext=${fontfileParam}text='${escapedLine}':fontsize=${fontSize}:fontcolor=white:x=(w-text_w)/2:y=${yExpr}:box=1:boxcolor=black@0.85:boxborderw=14:fix_bounds=1:enable='between(t,${textStart},${textEnd})'`
+          // enable expression must NOT be quoted - FFmpeg parses it directly
+          const lineFilter = `drawtext=${fontfileParam}text='${escapedLine}':fontsize=${fontSize}:fontcolor=white:x=(w-text_w)/2:y=${yExpr}:box=1:boxcolor=black@0.85:boxborderw=14:fix_bounds=1:enable=between(t,${textStart},${textEnd})`
           textFilters.push(lineFilter)
         }
         
