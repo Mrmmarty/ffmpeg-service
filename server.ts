@@ -6,7 +6,7 @@
  */
 
 import express, { Request, Response } from 'express'
-import fetch from 'node-fetch'
+// Use native fetch (Node 18+) instead of node-fetch to avoid dependency issues
 import { exec, spawn } from 'child_process'
 import { promisify } from 'util'
 import { writeFile, mkdir, readFile } from 'fs/promises'
