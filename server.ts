@@ -6,6 +6,7 @@
  */
 
 import express, { Request, Response } from 'express'
+import fetch from 'node-fetch'
 import { exec, spawn } from 'child_process'
 import { promisify } from 'util'
 import { writeFile, mkdir, readFile } from 'fs/promises'
@@ -361,36 +362,20 @@ async function processVideoAsync(
       const clipPath = path.join(workDir, `clip-${i}.mp4`)
       const duration = segment.duration || 3
       
-      // KEN BURNS EFFECT - ALWAYS APPLIED (user requirement: NO STATIC IMAGES)
-      // Redesigned to avoid aspect ratio drift and jitter by splitting background/foreground
-      const startZoom = 1.0
-      const endZoom = 1.12 // 12% zoom in (subtle, professional)
-      const totalFrames = Math.max(1, Math.round(duration * fps))
-      const zoomIncrement = (endZoom - startZoom) / totalFrames
-      const zoomExpr = `if(lte(on,1),${startZoom.toFixed(2)},min(zoom+${zoomIncrement.toFixed(6)},${endZoom.toFixed(2)}))`
-      
-      // Scale image larger to allow zoom room, then apply zoompan
-      const scaleFactor = 1.1
-      const scaledWidth = Math.round(width * scaleFactor)
-      const scaledHeight = Math.round(height * scaleFactor)
-      const blurSigma = 18
-      
+      // STATIC IMAGES - NO KEN BURNS (user requirement: fast cuts, no zoom/pan)
+      // Simple, clean scaling - no zoom, no pan, just static images with fast cuts
       let videoFilter: string
       
       if (segment.type === 'endplate') {
-        // Endplate: Use heavily blurred background with text overlay
+        // Endplate: Use blurred background with text overlay
+        const blurSigma = 18
         videoFilter = `[0:v]scale=${width}:${height}:flags=lanczos:force_original_aspect_ratio=increase,crop=${width}:${height},gblur=sigma=${blurSigma * 2}:steps=2`
       } else {
-        // Regular segments: Blurred background with animated main image on top
-        videoFilter =
-          `[0:v]split[bgsrc][fgsrc];` +
-          `[bgsrc]scale=${width}:${height}:flags=lanczos:force_original_aspect_ratio=increase,crop=${width}:${height},gblur=sigma=${blurSigma}:steps=2[bg];` +
-          `[fgsrc]scale=${scaledWidth}:${scaledHeight}:flags=lanczos:force_original_aspect_ratio=decrease,pad=${scaledWidth}:${scaledHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,` +
-          `zoompan=z='${zoomExpr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${width}x${height}:fps=${fps}[fg];` +
-          `[bg][fg]overlay=(W-w)/2:(H-h)/2`
+        // Regular segments: Static image, centered, no zoom/pan
+        videoFilter = `[0:v]scale=${width}:${height}:flags=lanczos:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`
       }
       
-      console.log(`[${jobId}] Segment ${i + 1}: Applying Ken Burns zoom effect (${startZoom.toFixed(2)}x → ${endZoom.toFixed(2)}x over ${duration.toFixed(2)}s, frames=${totalFrames})`)
+      console.log(`[${jobId}] Segment ${i + 1}: Static image (no zoom/pan) - ${duration.toFixed(2)}s`)
       
       if (segment.textOverlay) {
         // SMART TEXT OVERLAY THAT ALWAYS FITS THE FRAME
@@ -593,8 +578,8 @@ async function processVideoAsync(
     if (clipPaths.length !== segments.length) {
       console.warn(`[${jobId}] WARNING: Clip count mismatch! Expected ${segments.length}, got ${clipPaths.length}`)
     }
-    console.log(`[${jobId}] ✓ Ken Burns effect applied to all ${clipPaths.length} clips (zoom 1.0x → 1.12x)`)
-    console.log(`[${jobId}] ✓ Image scaling: Using pad (no crop) to show more of images, especially 3:2 aspect ratio`)
+    console.log(`[${jobId}] ✓ Static images (no zoom/pan) - fast cuts for ${clipPaths.length} clips`)
+    console.log(`[${jobId}] ✓ Image scaling: Centered, no crop, clean presentation`)
     onProgress?.({ stage: 'clips_created', progress: 50 })
 
     // Step 4: Concatenate clips with transitions
