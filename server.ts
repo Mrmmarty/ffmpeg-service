@@ -6,7 +6,6 @@
  */
 
 import express, { Request, Response } from 'express'
-// Use native fetch (Node 18+) instead of node-fetch to avoid dependency issues
 import { exec, spawn } from 'child_process'
 import { promisify } from 'util'
 import { writeFile, mkdir, readFile } from 'fs/promises'
@@ -14,6 +13,8 @@ import { existsSync } from 'fs'
 import path from 'path'
 import { v4 as uuidv4 } from 'uuid'
 
+// Native fetch is available in Node 18+ (no import needed)
+// @types/node includes fetch types for Node 18+
 const execAsync = promisify(exec)
 
 /**
