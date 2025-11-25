@@ -365,18 +365,22 @@ async function processVideoAsync(
       
       // STATIC IMAGES - NO KEN BURNS (user requirement: fast cuts, no zoom/pan)
       // Simple, clean scaling - no zoom, no pan, just static images with fast cuts
-      let videoFilter: string
+      // CRITICAL: Build filter chain that works with both -vf and -filter_complex
+      let baseFilter: string // Base video processing filter
+      let useFilterComplex = false // Will be set to true if we need filter_complex
       
       if (segment.type === 'endplate') {
         // Endplate: Use blurred background with text overlay
         const blurSigma = 18
-        videoFilter = `[0:v]scale=${width}:${height}:flags=lanczos:force_original_aspect_ratio=increase,crop=${width}:${height},gblur=sigma=${blurSigma * 2}:steps=2`
+        baseFilter = `scale=${width}:${height}:flags=lanczos:force_original_aspect_ratio=increase,crop=${width}:${height},gblur=sigma=${blurSigma * 2}:steps=2`
       } else {
         // Regular segments: Static image, centered, no zoom/pan
-        videoFilter = `[0:v]scale=${width}:${height}:flags=lanczos:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`
+        baseFilter = `scale=${width}:${height}:flags=lanczos:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`
       }
       
       console.log(`[${jobId}] Segment ${i + 1}: Static image (no zoom/pan) - ${duration.toFixed(2)}s`)
+      
+      let videoFilter = baseFilter
       
       if (segment.textOverlay) {
         // SMART TEXT OVERLAY THAT ALWAYS FITS THE FRAME
@@ -461,7 +465,8 @@ async function processVideoAsync(
           const lineY = baseYPosition + (lineIndex * (fontSize + lineSpacing))
           const yExpr = `if(lt(t,${textStart.toFixed(3)}),${(lineY + slideDistance).toFixed(3)},if(lt(t,${(textStart + fadeInDuration).toFixed(3)}),${(lineY + slideDistance).toFixed(3)}-(${(slideDistance / fadeInDuration).toFixed(3)}*(t-${textStart.toFixed(3)})),${lineY.toFixed(3)}))`
           const alphaExpr = `if(lt(t,${textStart.toFixed(3)}),0,if(lt(t,${(textStart + fadeInDuration).toFixed(3)}),(t-${textStart.toFixed(3)})/${fadeInDuration.toFixed(3)},if(lt(t,${(textEnd - fadeOutDuration).toFixed(3)}),1,if(lt(t,${textEnd.toFixed(3)}),(${textEnd.toFixed(3)}-t)/${fadeOutDuration.toFixed(3)},0))))`
-          const enableExpr = `enable='between(t,${textStart.toFixed(3)},${textEnd.toFixed(3)})'`
+          // Use expression directly without quotes - filter_complex handles expressions properly
+          const enableExpr = `enable=between(t,${textStart.toFixed(3)},${textEnd.toFixed(3)})`
           
           const lineFilter = [
             'drawtext',
@@ -487,11 +492,13 @@ async function processVideoAsync(
           textFilters.push(lineFilter)
         }
         
-        videoFilter += `,${textFilters.join(',')}`
+        // When we have text overlays with complex expressions, we MUST use filter_complex
+        // Append text filters to base filter
+        videoFilter = baseFilter + ',' + textFilters.join(',')
+        useFilterComplex = true // Force filter_complex for complex expressions
       }
 
       // Add dealer logo overlay if available (top-right corner, smaller size)
-      // Note: Logo overlay will be added as a separate input if logo is available
       let logoPath: string | null = null
       if (dealerInfo?.logoUrl && segment.type !== 'endplate') {
         try {
@@ -515,9 +522,13 @@ async function processVideoAsync(
       // Create video clip from image
       // Use HIGH QUALITY settings for better output
       // Use array format to avoid shell escaping issues
-      const useFilterComplex = videoFilter.includes('[') && videoFilter.includes(']') // Check if filter_complex syntax
+      // CRITICAL: Use filter_complex when we have text overlays OR logo overlays
+      // Complex expressions with nested if() statements require filter_complex
+      if (logoPath && existsSync(logoPath)) {
+        useFilterComplex = true
+      }
       
-      // Add logo as second input if available
+      // Build FFmpeg arguments
       const ffmpegArgs: string[] = [
         '-y',
         '-loop', '1',
@@ -527,24 +538,39 @@ async function processVideoAsync(
       // Add logo as second input if available
       if (logoPath && existsSync(logoPath)) {
         ffmpegArgs.push('-loop', '1', '-i', logoPath)
-        // Add logo overlay to filter_complex
-        // Find the last output label in the filter (usually ends with [v] or similar)
-        if (useFilterComplex) {
-          // Extract the last output label (e.g., [v] from the filter)
-          const lastOutputMatch = videoFilter.match(/\[(\w+)\]$/m)
-          const lastOutput = lastOutputMatch ? lastOutputMatch[1] : 'v'
-          // Append logo overlay
-          videoFilter += `;[1:v]scale=200:200:flags=lanczos[logo];[${lastOutput}][logo]overlay=W-w-40:40`
-        } else {
-          // Convert to filter_complex to add logo
-          videoFilter = `[0:v]${videoFilter}[v];[1:v]scale=200:200:flags=lanczos[logo];[v][logo]overlay=W-w-40:40`
-        }
-        console.log(`[${jobId}] Added dealer logo overlay for segment ${i + 1}`)
       }
       
+      // Format filter based on whether we're using filter_complex
+      if (useFilterComplex) {
+        // Use filter_complex format: [0:v]basefilter,drawtext1,drawtext2,...[v]
+        // Add logo overlay if present
+        let finalFilter = `[0:v]${videoFilter}`
+        
+        if (logoPath && existsSync(logoPath)) {
+          finalFilter += `[temp];[1:v]scale=200:200:flags=lanczos[logo];[temp][logo]overlay=W-w-40:40`
+        }
+        finalFilter += '[v]'
+        
+        // Log the filter for debugging (truncated if too long)
+        const filterPreview = finalFilter.length > 500 ? finalFilter.substring(0, 500) + '...' : finalFilter
+        console.log(`[${jobId}] Using filter_complex (text overlay or logo present)`)
+        console.log(`[${jobId}] Filter preview: ${filterPreview.replace(/\n/g, ' ')}`)
+        
+        ffmpegArgs.push(
+          '-t', duration.toString(),
+          '-filter_complex', finalFilter,
+          '-map', '[v]',
+        )
+      } else {
+        // Use simple -vf format (no text overlays, no logo)
+        ffmpegArgs.push(
+          '-t', duration.toString(),
+          '-vf', videoFilter,
+        )
+      }
+      
+      // Add encoding options
       ffmpegArgs.push(
-        '-t', duration.toString(),
-        ...(useFilterComplex || logoPath ? ['-filter_complex', videoFilter] : ['-vf', videoFilter]),
         '-c:v', 'libx264',
         '-preset', 'ultrafast', // Use ultrafast to minimize memory usage
         '-crf', '23', // Balanced quality
