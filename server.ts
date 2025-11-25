@@ -425,8 +425,10 @@ async function processVideoAsync(
         try {
           for (const fontPath of fontPaths) {
             if (existsSync(fontPath)) {
+              // In filter_complex, escape colons but don't use quotes for fontfile
               const escapedFontPath = fontPath.replace(/:/g, '\\:').replace(/'/g, "\\'")
-              fontfileParam = `fontfile='${escapedFontPath}':`
+              // Use escaped path directly without quotes for filter_complex compatibility
+              fontfileParam = `fontfile=${escapedFontPath}:`
               console.log(`[${jobId}] Using modern font: ${fontPath}`)
               break
             }
@@ -463,14 +465,32 @@ async function processVideoAsync(
             .replace(/\}/g, '\\}')
           
           const lineY = baseYPosition + (lineIndex * (fontSize + lineSpacing))
-          const yExpr = `if(lt(t,${textStart.toFixed(3)}),${(lineY + slideDistance).toFixed(3)},if(lt(t,${(textStart + fadeInDuration).toFixed(3)}),${(lineY + slideDistance).toFixed(3)}-(${(slideDistance / fadeInDuration).toFixed(3)}*(t-${textStart.toFixed(3)})),${lineY.toFixed(3)}))`
-          const alphaExpr = `if(lt(t,${textStart.toFixed(3)}),0,if(lt(t,${(textStart + fadeInDuration).toFixed(3)}),(t-${textStart.toFixed(3)})/${fadeInDuration.toFixed(3)},if(lt(t,${(textEnd - fadeOutDuration).toFixed(3)}),1,if(lt(t,${textEnd.toFixed(3)}),(${textEnd.toFixed(3)}-t)/${fadeOutDuration.toFixed(3)},0))))`
-          // Use expression directly without quotes - filter_complex handles expressions properly
+          
+          // Simplify expressions - use simpler animation that FFmpeg can parse more reliably
+          // Instead of complex nested if(), use simpler fade-in/fade-out with static position during display
+          const slideStart = textStart
+          const slideEnd = textStart + fadeInDuration
+          const fadeOutStart = textEnd - fadeOutDuration
+          const fadeOutEnd = textEnd
+          
+          // Simplified y position: start off-screen, slide in, then stay static
+          const yStart = lineY + slideDistance
+          const yFinal = lineY
+          const yExpr = `if(lt(t,${slideStart.toFixed(3)}),${yStart.toFixed(3)},if(lt(t,${slideEnd.toFixed(3)}),${yStart.toFixed(3)}+(${yFinal.toFixed(3)}-${yStart.toFixed(3)})*((t-${slideStart.toFixed(3)})/${fadeInDuration.toFixed(3)}),${yFinal.toFixed(3)}))`
+          
+          // Simplified alpha: fade in, stay visible, fade out
+          const alphaExpr = `if(lt(t,${slideStart.toFixed(3)}),0,if(lt(t,${slideEnd.toFixed(3)}),(t-${slideStart.toFixed(3)})/${fadeInDuration.toFixed(3)},if(lt(t,${fadeOutStart.toFixed(3)}),1,if(lt(t,${fadeOutEnd.toFixed(3)}),1-((t-${fadeOutStart.toFixed(3)})/${fadeOutDuration.toFixed(3)}),0))))`
+          
+          // Enable expression - use simpler format
           const enableExpr = `enable=between(t,${textStart.toFixed(3)},${textEnd.toFixed(3)})`
+          
+          // Build filter - escape text properly for filter_complex
+          // In filter_complex, text parameter needs special escaping
+          const escapedTextForFilter = escapedLine.replace(/'/g, "\\'").replace(/:/g, '\\:')
           
           const lineFilter = [
             'drawtext',
-            `${fontfileParam}text='${escapedLine}'`,
+            fontfileParam ? `${fontfileParam}text='${escapedTextForFilter}'` : `text='${escapedTextForFilter}'`,
             `fontsize=${fontSize}`,
             'fontcolor=white',
             'line_spacing=0',
@@ -487,15 +507,31 @@ async function processVideoAsync(
             'shadowy=6',
             'fix_bounds=1',
             enableExpr,
-          ].join(':').replace(/^drawtext:/, 'drawtext=')
+          ].filter(Boolean).join(':').replace(/^drawtext:/, 'drawtext=')
           
           textFilters.push(lineFilter)
         }
         
         // When we have text overlays with complex expressions, we MUST use filter_complex
-        // Append text filters to base filter
-        videoFilter = baseFilter + ',' + textFilters.join(',')
-        useFilterComplex = true // Force filter_complex for complex expressions
+        // Use intermediate outputs to avoid parser confusion with multiple complex expressions
+        // Structure: [0:v]base[v0];[v0]drawtext1[v1];[v1]drawtext2[v2];...
+        if (textFilters.length > 0) {
+          // Start with base filter outputting to [v0]
+          let filterChain = `[0:v]${baseFilter}[v0]`
+          
+          // Chain each drawtext filter with intermediate outputs
+          for (let idx = 0; idx < textFilters.length; idx++) {
+            const currentLabel = `v${idx}`
+            const nextLabel = idx === textFilters.length - 1 ? 'v' : `v${idx + 1}`
+            filterChain += `;[${currentLabel}]${textFilters[idx]}[${nextLabel}]`
+          }
+          
+          videoFilter = filterChain
+          useFilterComplex = true // Force filter_complex for complex expressions
+        } else {
+          // No text filters, but keep baseFilter format for potential logo addition later
+          videoFilter = baseFilter
+        }
       }
 
       // Add dealer logo overlay if available (top-right corner, smaller size)
@@ -542,14 +578,26 @@ async function processVideoAsync(
       
       // Format filter based on whether we're using filter_complex
       if (useFilterComplex) {
-        // Use filter_complex format: [0:v]basefilter,drawtext1,drawtext2,...[v]
-        // Add logo overlay if present
-        let finalFilter = `[0:v]${videoFilter}`
+        // videoFilter may be in filter_complex format (with [0:v]... labels) or simple format
+        let finalFilter = videoFilter
+        
+        // If videoFilter doesn't start with [0:v], we need to wrap it for filter_complex
+        if (!finalFilter.includes('[')) {
+          finalFilter = `[0:v]${finalFilter}[v]`
+        }
         
         if (logoPath && existsSync(logoPath)) {
-          finalFilter += `[temp];[1:v]scale=200:200:flags=lanczos[logo];[temp][logo]overlay=W-w-40:40`
+          // Get the last output label from the filter chain
+          const lastLabelMatch = finalFilter.match(/\[(\w+)\]$/)
+          const lastLabel = lastLabelMatch ? lastLabelMatch[1] : 'v'
+          
+          // Add logo overlay: scale logo, then overlay on last video output
+          finalFilter += `;[1:v]scale=200:200:flags=lanczos[logo];[${lastLabel}][logo]overlay=W-w-40:40[v]`
+        } else if (!finalFilter.endsWith('[v]')) {
+          // Ensure final output is [v] if no logo
+          // Replace last output label with [v] if needed
+          finalFilter = finalFilter.replace(/\[(\w+)\]$/, '[v]')
         }
-        finalFilter += '[v]'
         
         // Log the filter for debugging (truncated if too long)
         const filterPreview = finalFilter.length > 500 ? finalFilter.substring(0, 500) + '...' : finalFilter
