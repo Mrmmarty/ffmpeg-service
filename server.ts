@@ -459,8 +459,8 @@ async function processVideoAsync(
             .replace(/\}/g, '\\}')
           
           const lineY = baseYPosition + (lineIndex * (fontSize + lineSpacing))
-          const yExpr = `'if(lt(t,${textStart}),${lineY + slideDistance},if(lt(t,${(textStart + fadeInDuration).toFixed(3)}),${(lineY + slideDistance).toFixed(3)}-(${(slideDistance / fadeInDuration).toFixed(3)}*(t-${textStart.toFixed(3)})),${lineY}))'`
-          const alphaExpr = `'if(lt(t,${textStart}),0,if(lt(t,${(textStart + fadeInDuration).toFixed(3)}),(t-${textStart.toFixed(3)})/${fadeInDuration.toFixed(3)},if(lt(t,${(textEnd - fadeOutDuration).toFixed(3)}),1,if(lt(t,${textEnd.toFixed(3)}),(${textEnd.toFixed(3)}-t)/${fadeOutDuration.toFixed(3)},0))))'`
+          const yExpr = `if(lt(t,${textStart.toFixed(3)}),${(lineY + slideDistance).toFixed(3)},if(lt(t,${(textStart + fadeInDuration).toFixed(3)}),${(lineY + slideDistance).toFixed(3)}-(${(slideDistance / fadeInDuration).toFixed(3)}*(t-${textStart.toFixed(3)})),${lineY.toFixed(3)}))`
+          const alphaExpr = `if(lt(t,${textStart.toFixed(3)}),0,if(lt(t,${(textStart + fadeInDuration).toFixed(3)}),(t-${textStart.toFixed(3)})/${fadeInDuration.toFixed(3)},if(lt(t,${(textEnd - fadeOutDuration).toFixed(3)}),1,if(lt(t,${textEnd.toFixed(3)}),(${textEnd.toFixed(3)}-t)/${fadeOutDuration.toFixed(3)},0))))`
           const enableExpr = `enable='between(t,${textStart.toFixed(3)},${textEnd.toFixed(3)})'`
           
           const lineFilter = [
