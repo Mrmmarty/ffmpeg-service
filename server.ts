@@ -374,13 +374,31 @@ async function processVideoAsync(
         const blurSigma = 18
         baseFilter = `scale=${width}:${height}:flags=lanczos:force_original_aspect_ratio=increase,crop=${width}:${height},gblur=sigma=${blurSigma * 2}:steps=2`
       } else {
-        // Regular segments: Static image, centered, no zoom/pan
-        baseFilter = `scale=${width}:${height}:flags=lanczos:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`
+        // Regular segments: Blurred background fill technique (NO BLACK BARS)
+        // Strategy: 
+        // 1. Scale image 200% to fill vertical screen, blur it (background)
+        // 2. Scale original to fit, center it (foreground)
+        // 3. Overlay sharp foreground on blurred background
+        // This ALWAYS requires filter_complex for the overlay
+        baseFilter = `scale=${width}:${height}:flags=lanczos:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black@0,setsar=1`
+        // Note: We'll build the full blurred background filter chain below
       }
       
-      console.log(`[${jobId}] Segment ${i + 1}: Static image (no zoom/pan) - ${duration.toFixed(2)}s`)
+      console.log(`[${jobId}] Segment ${i + 1}: Static image with blurred background fill - ${duration.toFixed(2)}s`)
       
-      let videoFilter = baseFilter
+      // Build blurred background filter chain
+      // Background: scale 200%, blur (Gaussian blur radius ~30px = sigma ~15)
+      const blurSigma = 15 // Gaussian blur sigma (radius ~30px)
+      const scaleFactor = 2.0 // Scale up 200% for background
+      const bgFilter = `[0:v]scale=${Math.round(width * scaleFactor)}:${Math.round(height * scaleFactor)}:flags=lanczos:force_original_aspect_ratio=increase,crop=${width}:${height},gblur=sigma=${blurSigma}:steps=3[bg]`
+      // Foreground: scale to fit, center (sharp image)
+      const fgFilter = `[0:v]scale=${width}:${height}:flags=lanczos:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black@0,setsar=1[fg]`
+      // Overlay: place sharp foreground on blurred background
+      const overlayFilter = `[bg][fg]overlay=(W-w)/2:(H-h)/2[base]`
+      
+      // Start with blurred background base
+      let videoFilter = `${bgFilter};${fgFilter};${overlayFilter}`
+      useFilterComplex = true // Always use filter_complex for blurred background
       
       if (segment.textOverlay) {
         // SMART TEXT OVERLAY THAT ALWAYS FITS THE FRAME
@@ -517,31 +535,28 @@ async function processVideoAsync(
           textFilters.push(lineFilter)
         }
         
-        // When we have text overlays with complex expressions, we MUST use filter_complex
-        // Use intermediate outputs to avoid parser confusion with multiple complex expressions
-        // Structure: [0:v]base[v0];[v0]drawtext1[v1];[v1]drawtext2[v2];...
+        // When we have text overlays, chain them after the blurred background
+        // Structure: [bg][fg]overlay[base];[base]drawtext1[v0];[v0]drawtext2[v1];...
         if (textFilters.length > 0) {
-          // Start with base filter outputting to [v0]
-          let filterChain = `[0:v]${baseFilter}[v0]`
+          // Start with blurred background (already built above), output is [base]
+          let filterChain = videoFilter // Already has [base] output
           
           // Chain each drawtext filter with intermediate outputs using SEMICOLONS (not commas!)
           for (let idx = 0; idx < textFilters.length; idx++) {
-            const currentLabel = `v${idx}`
-            const nextLabel = idx === textFilters.length - 1 ? 'v' : `v${idx + 1}`
+            const currentLabel = idx === 0 ? 'base' : `v${idx - 1}`
+            const nextLabel = idx === textFilters.length - 1 ? 'v' : `v${idx}`
             // CRITICAL: Use semicolon to separate filters, each with input/output labels
             filterChain += `;[${currentLabel}]${textFilters[idx]}[${nextLabel}]`
           }
           
           videoFilter = filterChain
-          useFilterComplex = true // Force filter_complex for complex expressions
+          useFilterComplex = true // Already true, but ensure it stays true
           
           // Debug: Log the filter chain structure
-          console.log(`[${jobId}] Built filter chain with ${textFilters.length} text filters using intermediate outputs`)
+          console.log(`[${jobId}] Built filter chain with blurred background + ${textFilters.length} text filters`)
           console.log(`[${jobId}] Filter chain preview: ${filterChain.substring(0, 200)}...`)
-        } else {
-          // No text filters, but keep baseFilter format for potential logo addition later
-          videoFilter = baseFilter
         }
+        // If no text filters, videoFilter already has the blurred background setup
       }
 
       // Add dealer logo overlay if available (top-right corner, smaller size)
@@ -591,9 +606,16 @@ async function processVideoAsync(
         // videoFilter may be in filter_complex format (with [0:v]... labels) or simple format
         let finalFilter = videoFilter
         
-        // If videoFilter doesn't start with [0:v], we need to wrap it for filter_complex
+        // videoFilter should already be in filter_complex format (with labels)
+        // If it somehow isn't, wrap it (but it should be from blurred background setup)
         if (!finalFilter.includes('[')) {
           finalFilter = `[0:v]${finalFilter}[v]`
+        }
+        
+        // Ensure the final output label is [v] (replace [base] or other labels if needed)
+        if (finalFilter.includes('[base]') && !finalFilter.includes('drawtext')) {
+          // If we have [base] but no text overlays, rename it to [v]
+          finalFilter = finalFilter.replace(/\[base\]/g, '[v]')
         }
         
         if (logoPath && existsSync(logoPath)) {
