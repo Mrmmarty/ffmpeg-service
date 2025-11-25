@@ -469,10 +469,8 @@ async function processVideoAsync(
           const yExpr = `if(lt(t,${slideStart.toFixed(3)}),${yStart.toFixed(3)},if(lt(t,${slideEnd.toFixed(3)}),${yStart.toFixed(3)}+(${yFinal.toFixed(3)}-${yStart.toFixed(3)})*((t-${slideStart.toFixed(3)})/${fadeInDuration.toFixed(3)}),${yFinal.toFixed(3)}))`
           
           // Simplified alpha: fade in, stay visible, fade out
+          // Alpha already controls visibility (0 = invisible, 1 = visible), so we don't need enable parameter
           const alphaExpr = `if(lt(t,${slideStart.toFixed(3)}),0,if(lt(t,${slideEnd.toFixed(3)}),(t-${slideStart.toFixed(3)})/${fadeInDuration.toFixed(3)},if(lt(t,${fadeOutStart.toFixed(3)}),1,if(lt(t,${fadeOutEnd.toFixed(3)}),1-((t-${fadeOutStart.toFixed(3)})/${fadeOutDuration.toFixed(3)}),0))))`
-          
-          // Enable expression - use simpler format
-          const enableExpr = `enable=between(t,${textStart.toFixed(3)},${textEnd.toFixed(3)})`
           
           // Build filter - CRITICAL: For filter_complex, NO quotes around text!
           // Only escape characters that break filter parsing: colons, backslashes, equals, commas
@@ -509,7 +507,7 @@ async function processVideoAsync(
           filterParts.push('shadowx=0')
           filterParts.push('shadowy=6')
           filterParts.push('fix_bounds=1')
-          filterParts.push(enableExpr)
+          // Removed enable parameter - alpha expression already controls visibility
           
           const lineFilter = `drawtext=${filterParts.join(':')}`
           textFilters.push(lineFilter)
