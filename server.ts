@@ -425,10 +425,10 @@ async function processVideoAsync(
         try {
           for (const fontPath of fontPaths) {
             if (existsSync(fontPath)) {
-              // In filter_complex, escape colons but don't use quotes for fontfile
-              const escapedFontPath = fontPath.replace(/:/g, '\\:').replace(/'/g, "\\'")
-              // Use escaped path directly without quotes for filter_complex compatibility
-              fontfileParam = `fontfile=${escapedFontPath}:`
+              // Escape colons and backslashes for filter_complex (NO quotes!)
+              const escapedFontPath = fontPath.replace(/\\/g, '\\\\').replace(/:/g, '\\:')
+              // Store just the escaped path, we'll add fontfile= prefix later
+              fontfileParam = escapedFontPath
               console.log(`[${jobId}] Using modern font: ${fontPath}`)
               break
             }
@@ -452,17 +452,7 @@ async function processVideoAsync(
         const textFilters: string[] = []
         for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
           const line = lines[lineIndex]
-          const escapedLine = line
-            .replace(/\\/g, '\\\\')
-            .replace(/:/g, '\\:')
-            .replace(/'/g, "\\'")
-            .replace(/"/g, '\\"')
-            .replace(/\(/g, '\\(')
-            .replace(/\)/g, '\\)')
-            .replace(/\[/g, '\\[')
-            .replace(/\]/g, '\\]')
-            .replace(/\{/g, '\\{')
-            .replace(/\}/g, '\\}')
+          // Don't escape here - we'll do proper escaping later for filter_complex
           
           const lineY = baseYPosition + (lineIndex * (fontSize + lineSpacing))
           
@@ -484,31 +474,44 @@ async function processVideoAsync(
           // Enable expression - use simpler format
           const enableExpr = `enable=between(t,${textStart.toFixed(3)},${textEnd.toFixed(3)})`
           
-          // Build filter - escape text properly for filter_complex
-          // In filter_complex, text parameter needs special escaping
-          const escapedTextForFilter = escapedLine.replace(/'/g, "\\'").replace(/:/g, '\\:')
+          // Build filter - CRITICAL: For filter_complex, NO quotes around text!
+          // Only escape characters that break filter parsing: colons, backslashes, equals, commas
+          // DO NOT escape parentheses, brackets, or quotes in the text itself
+          const textForFilter = line
+            .replace(/\\/g, '\\\\')   // Escape backslashes first
+            .replace(/:/g, '\\:')     // Escape colons (required)
+            .replace(/=/g, '\\=')     // Escape equals (required)
+            .replace(/,/g, '\\,')     // Escape commas (required for filter_complex)
           
-          const lineFilter = [
-            'drawtext',
-            fontfileParam ? `${fontfileParam}text='${escapedTextForFilter}'` : `text='${escapedTextForFilter}'`,
-            `fontsize=${fontSize}`,
-            'fontcolor=white',
-            'line_spacing=0',
-            'x=(w-text_w)/2',
-            `y=${yExpr}`,
-            `alpha=${alphaExpr}`,
-            'box=1',
-            'boxcolor=0x050505@0.55',
-            'boxborderw=12',
-            'bordercolor=0xffffff@0.35',
-            'borderw=2',
-            'shadowcolor=0x000000@0.85',
-            'shadowx=0',
-            'shadowy=6',
-            'fix_bounds=1',
-            enableExpr,
-          ].filter(Boolean).join(':').replace(/^drawtext:/, 'drawtext=')
+          // Build drawtext filter parameters
+          // Use single quotes around text value for filter_complex compatibility
+          const filterParts: string[] = []
           
+          if (fontfileParam) {
+            // fontfile parameter - escaped path without quotes
+            filterParts.push(`fontfile=${fontfileParam}`)
+          }
+          
+          // Text parameter - use single quotes around value (required for filter_complex with special chars)
+          filterParts.push(`text='${textForFilter}'`)
+          filterParts.push(`fontsize=${fontSize}`)
+          filterParts.push('fontcolor=white')
+          filterParts.push('line_spacing=0')
+          filterParts.push('x=(w-text_w)/2')
+          filterParts.push(`y=${yExpr}`)
+          filterParts.push(`alpha=${alphaExpr}`)
+          filterParts.push('box=1')
+          filterParts.push('boxcolor=0x050505@0.55')
+          filterParts.push('boxborderw=12')
+          filterParts.push('bordercolor=0xffffff@0.35')
+          filterParts.push('borderw=2')
+          filterParts.push('shadowcolor=0x000000@0.85')
+          filterParts.push('shadowx=0')
+          filterParts.push('shadowy=6')
+          filterParts.push('fix_bounds=1')
+          filterParts.push(enableExpr)
+          
+          const lineFilter = `drawtext=${filterParts.join(':')}`
           textFilters.push(lineFilter)
         }
         
@@ -519,15 +522,20 @@ async function processVideoAsync(
           // Start with base filter outputting to [v0]
           let filterChain = `[0:v]${baseFilter}[v0]`
           
-          // Chain each drawtext filter with intermediate outputs
+          // Chain each drawtext filter with intermediate outputs using SEMICOLONS (not commas!)
           for (let idx = 0; idx < textFilters.length; idx++) {
             const currentLabel = `v${idx}`
             const nextLabel = idx === textFilters.length - 1 ? 'v' : `v${idx + 1}`
+            // CRITICAL: Use semicolon to separate filters, each with input/output labels
             filterChain += `;[${currentLabel}]${textFilters[idx]}[${nextLabel}]`
           }
           
           videoFilter = filterChain
           useFilterComplex = true // Force filter_complex for complex expressions
+          
+          // Debug: Log the filter chain structure
+          console.log(`[${jobId}] Built filter chain with ${textFilters.length} text filters using intermediate outputs`)
+          console.log(`[${jobId}] Filter chain preview: ${filterChain.substring(0, 200)}...`)
         } else {
           // No text filters, but keep baseFilter format for potential logo addition later
           videoFilter = baseFilter
