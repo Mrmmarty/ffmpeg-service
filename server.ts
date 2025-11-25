@@ -482,7 +482,7 @@ async function processVideoAsync(
             'shadowy=6',
             'fix_bounds=1',
             enableExpr,
-          ].join(':')
+          ].join(':').replace(/^drawtext:/, 'drawtext=')
           
           textFilters.push(lineFilter)
         }
