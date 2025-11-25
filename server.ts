@@ -218,7 +218,7 @@ async function processVideoAsync(
       return
     }
 
-    const transitionType = options?.transitionType || 'crossfade'
+    const transitionType = (options?.transitionType || 'blur').toLowerCase()
     const transitionDuration = options?.transitionDuration || 0.5
     // Higher resolution for better quality (4K vertical = 2160x3840, but use 1440x2560 for balance)
     // Using 1080x1920 for now but ensure high quality input
@@ -380,87 +380,72 @@ async function processVideoAsync(
       
       if (segment.textOverlay) {
         // SMART TEXT OVERLAY THAT ALWAYS FITS THE FRAME
-        // Simple, reliable approach: Fixed font sizes with character limits
+        // Add subtle animation (fade + slide) for modern look
         let fontSize: number
         let maxCharsPerLine: number
         
         if (segment.type === 'opener') {
-          fontSize = Math.round(42 * fontSizeMultiplier) // Readable but not too large
-          maxCharsPerLine = 30 // ~30 chars fit at 42px on 1080px width
+          fontSize = Math.round(42 * fontSizeMultiplier)
+          maxCharsPerLine = 30
         } else if (segment.type === 'cta') {
-          fontSize = Math.round(52 * fontSizeMultiplier) // Larger for call-to-action
-          maxCharsPerLine = 25 // ~25 chars fit at 52px
+          fontSize = Math.round(52 * fontSizeMultiplier)
+          maxCharsPerLine = 25
         } else {
-          fontSize = Math.round(38 * fontSizeMultiplier) // Standard for features
-          maxCharsPerLine = 32 // ~32 chars fit at 38px
+          fontSize = Math.round(38 * fontSizeMultiplier)
+          maxCharsPerLine = 32
         }
         
-        // Wrap text to fit character limit per line
         const wrappedText = wrapTextSimple(segment.textOverlay, maxCharsPerLine)
-        const lines = wrappedText.split('\n').filter(line => line.trim().length > 0) // Remove empty lines
+        const lines = wrappedText.split('\n').filter(line => line.trim().length > 0)
         const maxLineLength = Math.max(...lines.map(l => l.length), 1)
         
-        // Calculate line spacing and position
-        const lineSpacing = Math.max(8, Math.floor(fontSize * 0.25)) // 25% of font size for better readability
+        const lineSpacing = Math.max(8, Math.floor(fontSize * 0.25))
         const totalTextHeight = (fontSize + lineSpacing) * lines.length - lineSpacing
         
-        // Use textTiming if provided, otherwise show for entire duration
         const textStart = segment.textTiming?.start ?? 0
-        const textDuration = segment.textTiming?.duration ?? duration
+        const textDuration = Math.max(0.75, segment.textTiming?.duration ?? duration)
         const textEnd = Math.min(textStart + textDuration, duration)
+        const fadeInDuration = Math.min(0.45, Math.max(0.2, textDuration * 0.4))
+        const fadeOutDuration = Math.min(0.35, Math.max(0.2, textDuration * 0.3))
+        const slideDistance = segment.type === 'cta' ? 100 : 70
         
-        // Log text timing and sizing for debugging
         console.log(`[${jobId}] Segment ${i} text overlay: "${wrappedText.substring(0, 60).replace(/\n/g, ' | ')}..." (${lines.length} lines, ${maxLineLength} chars/line, font: ${fontSize}px) timing: ${textStart}s-${textEnd}s`)
         
-        // Use modern font (DejaVu Sans Bold for clean, modern look)
-        // Modern fonts installed in Docker: DejaVu Sans, Liberation Sans, Noto Sans
         const fontPaths = [
-          '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', // DejaVu Sans Bold (modern, clean, bold)
-          '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf', // Liberation Sans Bold (fallback)
-          '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', // DejaVu Sans Regular (fallback)
+          '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+          '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf',
+          '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
         ]
         
-        // Check which font is available (for local dev vs Docker)
         let fontfileParam = ''
         try {
-          // Try to find an available font
           for (const fontPath of fontPaths) {
             if (existsSync(fontPath)) {
-              // Escape font path for FFmpeg (escape colons and special chars)
               const escapedFontPath = fontPath.replace(/:/g, '\\:').replace(/'/g, "\\'")
               fontfileParam = `fontfile='${escapedFontPath}':`
               console.log(`[${jobId}] Using modern font: ${fontPath}`)
               break
             }
           }
-          // If no font found, FFmpeg will use system default (still modern on most systems)
           if (!fontfileParam) {
             console.log(`[${jobId}] No custom font found, using FFmpeg default font`)
           }
         } catch (error) {
-          // If font check fails, use default (FFmpeg will handle it)
           console.log(`[${jobId}] Font check failed, using default`)
         }
         
-        // CRITICAL FIX: FFmpeg drawtext does NOT support newlines (\n)
-        // We must create separate drawtext filters for each line
-        // Calculate base Y position based on segment type
         let baseYPosition: number
         if (segment.type === 'opener') {
-          baseYPosition = 60 // Top area
+          baseYPosition = 80
         } else if (segment.type === 'cta') {
-          // For CTA, position from bottom: h - totalTextHeight - margin
-          baseYPosition = 1920 - totalTextHeight - 150 // Bottom area with margin
+          baseYPosition = height - totalTextHeight - 180
         } else {
-          baseYPosition = 100 // Middle-top area
+          baseYPosition = 140
         }
         
-        // Create one drawtext filter per line
         const textFilters: string[] = []
         for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
           const line = lines[lineIndex]
-          
-          // Escape text for FFmpeg drawtext filter (NO newline escaping - we handle lines separately)
           const escapedLine = line
             .replace(/\\/g, '\\\\')
             .replace(/:/g, '\\:')
@@ -473,24 +458,35 @@ async function processVideoAsync(
             .replace(/\{/g, '\\{')
             .replace(/\}/g, '\\}')
           
-          // Calculate Y position for this line (stack lines vertically)
           const lineY = baseYPosition + (lineIndex * (fontSize + lineSpacing))
+          const yExpr = `'if(lt(t,${textStart}),${lineY + slideDistance},if(lt(t,${(textStart + fadeInDuration).toFixed(3)}),${(lineY + slideDistance).toFixed(3)}-(${(slideDistance / fadeInDuration).toFixed(3)}*(t-${textStart.toFixed(3)})),${lineY}))'`
+          const alphaExpr = `'if(lt(t,${textStart}),0,if(lt(t,${(textStart + fadeInDuration).toFixed(3)}),(t-${textStart.toFixed(3)})/${fadeInDuration.toFixed(3)},if(lt(t,${(textEnd - fadeOutDuration).toFixed(3)}),1,if(lt(t,${textEnd.toFixed(3)}),(${textEnd.toFixed(3)}-t)/${fadeOutDuration.toFixed(3)},0))))'`
+          const enableExpr = `enable='between(t,${textStart.toFixed(3)},${textEnd.toFixed(3)})'`
           
-          // Simplified Y position - static for now to get basic rendering working
-          // TODO: Add back animation once basic rendering is confirmed working
-          // Animation can be added using simpler expressions or separate filter chains
-          const yExpr = `${lineY}`
+          const lineFilter = [
+            'drawtext',
+            `${fontfileParam}text='${escapedLine}'`,
+            `fontsize=${fontSize}`,
+            'fontcolor=white',
+            'line_spacing=0',
+            'x=(w-text_w)/2',
+            `y=${yExpr}`,
+            `alpha=${alphaExpr}`,
+            'box=1',
+            'boxcolor=0x050505@0.55',
+            'boxborderw=12',
+            'bordercolor=0xffffff@0.35',
+            'borderw=2',
+            'shadowcolor=0x000000@0.85',
+            'shadowx=0',
+            'shadowy=6',
+            'fix_bounds=1',
+            enableExpr,
+          ].join(':')
           
-          // x=(w-text_w)/2 centers horizontally using actual text width
-          // box=1 creates background box that scales with text
-          // fix_bounds=1 ensures text doesn't go outside frame boundaries
-          // Note: enable parameter removed due to FFmpeg filter_complex parsing issues with commas
-          // Text will display for the full segment duration - we can add timing control via select filter if needed
-          const lineFilter = `drawtext=${fontfileParam}text='${escapedLine}':fontsize=${fontSize}:fontcolor=white:x=(w-text_w)/2:y=${yExpr}:box=1:boxcolor=black@0.85:boxborderw=14:fix_bounds=1`
           textFilters.push(lineFilter)
         }
         
-        // Add all text filters to video filter
         videoFilter += `,${textFilters.join(',')}`
       }
 
@@ -981,6 +977,8 @@ function getTransitionName(type: string): string {
     fade: 'fade',
     crossfade: 'fade',
     dissolve: 'fade',
+    blur: 'fadeblack',
+    fadeblack: 'fadeblack',
     wipe: 'wipeleft',
     wipeleft: 'wipeleft',
     wiperight: 'wiperight',
@@ -992,6 +990,11 @@ function getTransitionName(type: string): string {
     slide: 'slideleft',
     slideleft: 'slideleft',
     slideright: 'slideright',
+    smooth: 'smoothleft',
+    smoothleft: 'smoothleft',
+    smoothright: 'smoothright',
+    smoothup: 'smoothup',
+    smoothdown: 'smoothdown',
   }
   
   return transitions[type.toLowerCase()] || 'fade'
