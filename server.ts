@@ -218,7 +218,8 @@ async function processVideoAsync(
       return
     }
 
-    const transitionType = (options?.transitionType || 'blur').toLowerCase()
+    // CRITICAL: Default to 'none' for reliability - xfade can fail with many clips
+    const transitionType = (options?.transitionType || 'none').toLowerCase()
     const transitionDuration = options?.transitionDuration || 0.5
     // Higher resolution for better quality (4K vertical = 2160x3840, but use 1440x2560 for balance)
     // Using 1080x1920 for now but ensure high quality input
@@ -423,7 +424,20 @@ async function processVideoAsync(
       
       // Start with white border cropping, then blurred background
       let videoFilter = `${cropFilter};${bgFilter};${fgFilter};${overlayFilter}`
+      let currentVideoLabel = 'base'
       useFilterComplex = true // Always use filter_complex for blurred background + cropping
+      const gradientSlices = [
+        { height: Math.max(60, Math.round(height * 0.10)), opacity: 0.65 },
+        { height: Math.max(40, Math.round(height * 0.08)), opacity: 0.4 },
+        { height: Math.max(30, Math.round(height * 0.06)), opacity: 0.2 },
+      ]
+      let gradientOffset = 0
+      gradientSlices.forEach((slice, sliceIdx) => {
+        const nextLabel = `grad_${i}_${sliceIdx}`
+        videoFilter += `;[${currentVideoLabel}]drawbox=x=0:y=${gradientOffset}:w=iw:h=${slice.height}:color=0x000000@${slice.opacity}:t=fill[${nextLabel}]`
+        currentVideoLabel = nextLabel
+        gradientOffset += slice.height
+      })
       
       console.log(`[${jobId}] Segment ${i + 1}: Cropping white borders (${cropPercent}% from edges) + blurred background fill`)
       
@@ -542,19 +556,16 @@ async function processVideoAsync(
           // Text parameter - use single quotes around value (required for filter_complex with special chars)
           filterParts.push(`text='${textForFilter}'`)
           filterParts.push(`fontsize=${fontSize}`)
-          filterParts.push('fontcolor=white')
+          filterParts.push('fontcolor=white@0.98')
           filterParts.push('line_spacing=0')
           filterParts.push('x=(w-text_w)/2')
           filterParts.push(`y=${yExpr}`)
           filterParts.push(`alpha=${alphaExpr}`)
-          filterParts.push('box=1')
-          filterParts.push('boxcolor=0x050505@0.55')
-          filterParts.push('boxborderw=12')
-          filterParts.push('bordercolor=0xffffff@0.35')
-          filterParts.push('borderw=2')
-          filterParts.push('shadowcolor=0x000000@0.85')
+          filterParts.push('bordercolor=0x000000@0.45')
+          filterParts.push('borderw=1.5')
+          filterParts.push('shadowcolor=0x000000@0.95')
           filterParts.push('shadowx=0')
-          filterParts.push('shadowy=6')
+          filterParts.push('shadowy=8')
           filterParts.push('fix_bounds=1')
           // Removed enable parameter - alpha expression already controls visibility
           
@@ -570,7 +581,7 @@ async function processVideoAsync(
           
           // Chain each drawtext filter with intermediate outputs using SEMICOLONS (not commas!)
           for (let idx = 0; idx < textFilters.length; idx++) {
-            const currentLabel = idx === 0 ? 'base' : `v${idx - 1}`
+            const currentLabel = idx === 0 ? currentVideoLabel : `v${idx - 1}`
             const nextLabel = idx === textFilters.length - 1 ? 'v' : `v${idx}`
             // CRITICAL: Use semicolon to separate filters, each with input/output labels
             filterChain += `;[${currentLabel}]${textFilters[idx]}[${nextLabel}]`
@@ -710,8 +721,21 @@ async function processVideoAsync(
     
     console.log(`[${jobId}] ✓ Created ${clipPaths.length} clips (expected ${segments.length})`)
     if (clipPaths.length !== segments.length) {
-      console.warn(`[${jobId}] WARNING: Clip count mismatch! Expected ${segments.length}, got ${clipPaths.length}`)
+      console.error(`[${jobId}] ❌ CRITICAL ERROR: Clip count mismatch! Expected ${segments.length}, got ${clipPaths.length}`)
+      throw new Error(`Clip count mismatch: Expected ${segments.length} clips, but only created ${clipPaths.length}`)
     }
+    
+    // CRITICAL: Verify all clips exist and log their paths
+    console.log(`[${jobId}] Verifying all ${clipPaths.length} clips exist...`)
+    for (let i = 0; i < clipPaths.length; i++) {
+      if (!existsSync(clipPaths[i])) {
+        console.error(`[${jobId}] ❌ CRITICAL: Clip ${i + 1} does not exist: ${clipPaths[i]}`)
+        throw new Error(`Clip ${i + 1} does not exist: ${clipPaths[i]}`)
+      }
+      const stats = await import('fs').then(fs => fs.promises.stat(clipPaths[i]))
+      console.log(`[${jobId}]   ✓ Clip ${i + 1}/${clipPaths.length}: ${clipPaths[i]} (${(stats.size / 1024).toFixed(1)}KB)`)
+    }
+    
     console.log(`[${jobId}] ✓ Static images (no zoom/pan) - fast cuts for ${clipPaths.length} clips`)
     console.log(`[${jobId}] ✓ Image scaling: Centered, no crop, clean presentation`)
     onProgress?.({ stage: 'clips_created', progress: 50 })
@@ -743,8 +767,25 @@ async function processVideoAsync(
 
       try {
         console.log(`[${jobId}] Starting fast concatenation (no transitions) with ${clipPaths.length} clips...`)
+        console.log(`[${jobId}] Concat list content (first 5 lines):`)
+        const concatListLines = concatList.split('\n')
+        concatListLines.slice(0, 5).forEach((line, i) => {
+          console.log(`[${jobId}]   ${i + 1}. ${line}`)
+        })
+        if (concatListLines.length > 5) {
+          console.log(`[${jobId}]   ... and ${concatListLines.length - 5} more`)
+        }
         await execFFmpeg(concatArgs, workDir, jobId, 60000) // 1 min timeout (much faster!)
         console.log(`[${jobId}] ✓ Concatenation complete: ${finalVideoPath}`)
+        
+        // Verify final video exists and has reasonable size
+        if (existsSync(finalVideoPath)) {
+          const stats = await import('fs').then(fs => fs.promises.stat(finalVideoPath))
+          console.log(`[${jobId}] ✓ Final video: ${finalVideoPath} (${(stats.size / 1024 / 1024).toFixed(2)}MB)`)
+        } else {
+          console.error(`[${jobId}] ❌ CRITICAL: Final video does not exist after concatenation!`)
+        }
+        
         onProgress?.({ stage: 'concatenated', progress: 70 })
       } catch (error) {
         console.error(`[${jobId}] Error concatenating clips:`, error)
@@ -1150,7 +1191,7 @@ async function cleanup(workDir: string) {
   }
 }
 
-const PORT = process.env.PORT || 3001
+const PORT = process.env.PORT || process.env.FFMPEG_SERVICE_PORT || 3001
 app.listen(PORT, () => {
   console.log(`FFmpeg Video Rendering Service running on port ${PORT}`)
   console.log(`Health check: http://localhost:${PORT}/health`)
